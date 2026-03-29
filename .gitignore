@@ -1,0 +1,9 @@
+api_keys.json
+jobs.json
+publish_log.txt
+logs/
+tmp_images/
+local_images/
+data/prompts/
+*.pid
+*.status

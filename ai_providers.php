@@ -136,15 +136,16 @@ class GeminiProvider implements AIProvider {
         // Flash: thinking 비활성화, 일반 타임아웃
         $genConfig = ['maxOutputTokens' => $maxTokens];
         if ($isPro) {
-            $genConfig['thinkingConfig'] = ['thinkingBudget' => 8192];
-            $timeout = 600;       // Pro: 10분 (thinking + 긴 출력)
-            $connectTimeout = 30; // 연결 타임아웃 30초
-            $maxRetries = 2;      // Pro는 1회 재시도
+            // ★ v4: thinkingBudget 축소 (8192→4096) — 블로그 글 생성은 thinking보다 출력이 중요
+            $genConfig['thinkingConfig'] = ['thinkingBudget' => 4096];
+            $timeout = 600;       // Pro: 10분
+            $connectTimeout = 30;
+            $maxRetries = 2;
         } else {
             $genConfig['thinkingConfig'] = ['thinkingBudget' => 0];
             $timeout = 180;       // Flash: 3분
             $connectTimeout = 15; // 연결 타임아웃 15초
-            $maxRetries = 1;      // Flash는 재시도 없음
+            $maxRetries = 3;      // Flash 재시도 3회 (503 과부하 대응)
         }
 
         $url = "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}";
@@ -310,15 +311,16 @@ class AIRouter {
     /**
      * 글 생성 (일일 한도 체크 + 폴백)
      */
-    public function generateBlogPost($keyword, $naver_data = [], $internal_links = [], $random = false, $contentMin = 3000, $contentMax = 5000) {
+    public function generateBlogPost($keyword, $naver_data = [], $internal_links = [], $random = false, $contentMin = 3000, $contentMax = 5000, $imageCount = 2) {
         if (empty($this->providers)) {
             write_log("설정된 AI가 없습니다!");
             return null;
         }
 
-        $prompts = PromptData::buildPrompts($keyword, $naver_data, $internal_links, $contentMin, $contentMax);
-        // 한글 1자 ≈ 2~2.5 토큰 + JSON 오버헤드 → 넉넉하게 계산
-        $maxTokens = max(8192, min(32768, (int)($contentMax * 2.5) + 2000));
+        $prompts = PromptData::buildPrompts($keyword, $naver_data, $internal_links, $contentMin, $contentMax, null, $imageCount);
+        // ★ v4: 한글 1자 ≈ 2~3 토큰 + JSON 오버헤드 + thinking 여유분 → 대폭 상향
+        $maxTokens = max(16384, min(65536, (int)($contentMax * 3.5) + 4000));
+        write_log("프롬프트 분량 설정: {$contentMin}~{$contentMax}자 → maxTokens:{$maxTokens}");
         $count = file_exists(COUNTER_FILE) ? intval(file_get_contents(COUNTER_FILE)) : 0;
         $total = count($this->providers);
 
@@ -375,22 +377,23 @@ class AIRouter {
     /**
      * 특정 AI 프로바이더로 직접 생성
      */
-    public function generateWithProvider($keyword, $providerKey, $naver_data = [], $internal_links = [], $contentMin = 3000, $contentMax = 5000) {
+    public function generateWithProvider($keyword, $providerKey, $naver_data = [], $internal_links = [], $contentMin = 3000, $contentMax = 5000, $imageCount = 2) {
         $providerMap = ['claude'=>new ClaudeProvider(),'grok'=>new GrokProvider(),'chatgpt'=>new ChatGPTProvider(),'gemini'=>new GeminiProvider()];
         $provider = $providerMap[$providerKey] ?? null;
 
         if (!$provider || !$provider->isConfigured()) {
             write_log("{$providerKey} 사용 불가 → 로테이션 폴백");
-            return $this->generateBlogPost($keyword, $naver_data, $internal_links, false, $contentMin, $contentMax);
+            return $this->generateBlogPost($keyword, $naver_data, $internal_links, false, $contentMin, $contentMax, $imageCount);
         }
         if (!checkAiDailyLimit($providerKey)) {
             write_log("{$providerKey} 한도 초과 → 로테이션 폴백");
-            return $this->generateBlogPost($keyword, $naver_data, $internal_links, false, $contentMin, $contentMax);
+            return $this->generateBlogPost($keyword, $naver_data, $internal_links, false, $contentMin, $contentMax, $imageCount);
         }
 
-        $prompts = PromptData::buildPrompts($keyword, $naver_data, $internal_links, $contentMin, $contentMax);
-        $maxTokens = max(8192, min(32768, (int)($contentMax * 2.5) + 2000));
-        write_log("AI 호출: {$provider->getName()} (지정) [max_tokens:{$maxTokens}]");
+        $prompts = PromptData::buildPrompts($keyword, $naver_data, $internal_links, $contentMin, $contentMax, null, $imageCount);
+        // ★ v4: maxTokens 대폭 상향
+        $maxTokens = max(16384, min(65536, (int)($contentMax * 3.5) + 4000));
+        write_log("AI 호출: {$provider->getName()} (지정) [max_tokens:{$maxTokens}, 목표:{$contentMin}~{$contentMax}자]");
 
         $response = $provider->callAPI($prompts['system'], $prompts['user'], $maxTokens);
         if ($response) {
@@ -463,7 +466,43 @@ class AIRouter {
         $data = json_decode($json, true);
         if (!$data) { $data = json_decode(preg_replace('/[\x00-\x1F\x7F]/u', ' ', $json), true); }
         if (!$data || empty($data['title']) || empty($data['content'])) return null;
+
+        // ★ v4: slug 영문 강제 변환 — 한글이 포함되면 제목 기반으로 영문 slug 생성
+        if (!empty($data['slug'])) {
+            // 한글/비ASCII 문자가 포함되어 있으면 영문으로 변환
+            if (preg_match('/[^\x20-\x7E]/', $data['slug'])) {
+                $data['slug'] = $this->generateEnglishSlug($data['title'], $data['focus_keyphrase'] ?? '');
+                write_log("⚠️ 한글 slug 감지 → 영문 변환: {$data['slug']}");
+            }
+        }
+        // slug가 비어있으면 생성
+        if (empty($data['slug'])) {
+            $data['slug'] = $this->generateEnglishSlug($data['title'], $data['focus_keyphrase'] ?? '');
+        }
+        // slug 정규화 (소문자, 하이픈, 특수문자 제거)
+        $data['slug'] = preg_replace('/[^a-z0-9\-]/', '', strtolower(str_replace(' ', '-', $data['slug'])));
+        $data['slug'] = preg_replace('/-+/', '-', trim($data['slug'], '-'));
+        // 너무 길면 자르기 (최대 60자)
+        if (strlen($data['slug']) > 60) {
+            $data['slug'] = substr($data['slug'], 0, 60);
+            $data['slug'] = preg_replace('/-[^-]*$/', '', $data['slug']); // 단어 중간 잘림 방지
+        }
+
         return $data;
+    }
+
+    /**
+     * 제목/키워드에서 영문 slug 생성
+     */
+    private function generateEnglishSlug($title, $keyword = '') {
+        // 영문 단어만 추출
+        $source = $keyword ?: $title;
+        preg_match_all('/[a-zA-Z0-9]+/', $source, $matches);
+        if (!empty($matches[0])) {
+            return strtolower(implode('-', array_slice($matches[0], 0, 5)));
+        }
+        // 영문이 전혀 없으면 타임스탬프 기반
+        return 'post-' . date('Ymd-His');
     }
 
     /**

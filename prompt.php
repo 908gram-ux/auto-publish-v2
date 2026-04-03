@@ -1,6 +1,13 @@
 <?php
 /**
- * SEO 최적화 + 자연스러운 글쓰기 프롬프트
+ * SEO 최적화 + 자연스러운 글쓰기 프롬프트 v3
+ * 
+ * v3 변경사항:
+ * - 글자수 지시 → 구조적 분량 지시 (소제목/문단 수 기반)
+ * - 테이블 3열 규칙 → 프롬프트 최상단 배치
+ * - 제목 패턴 반복 방지 규칙 추가
+ * - AI 상투어 금지 목록 대폭 강화
+ * - 분량별 구조 자동 계산 (contentMin 기반)
  */
 
 require_once __DIR__ . '/config.php';
@@ -57,14 +64,40 @@ class PromptData {
         '접속사를 다양하게: 그런데/하지만/다만/반면/물론/솔직히/참고로 등을 섞어라. "그리고"만 반복하지 마라.',
     ];
 
+    // ── 제목 패턴 풀 (반복 방지용) ──
+    public static $titlePatterns = [
+        '숫자형: "~하는 N가지 방법" 또는 "TOP N" (예: "직장인이 꼭 알아야 할 5가지")',
+        '질문형: "~일까?" 또는 "왜 ~할까?" (예: "아직도 이걸 모른다고?")',
+        '대비형: "A vs B" 또는 "~인데 ~하다" (예: "싸다고 무시했다가 후회한 제품")',
+        '숫자+기간형: "2026년 ~" 또는 "최신 ~" (예: "2026년 가성비 노트북 추천")',
+        '경험형: "직접 ~해봤다" 또는 "~후기" (예: "3개월 써보고 느낀 점")',
+        '반전형: "알고 보니 ~" 또는 "~의 진실" (예: "맛없다고 소문난 그 집, 알고 보니")',
+        '타겟형: "~를 위한 ~" 또는 "초보자도 ~" (예: "입문자를 위한 완벽 가이드")',
+        '방법형: "~하는 법" 또는 "~ 총정리" (예: "10분 만에 끝내는 정리법")',
+    ];
+
+    /**
+     * 분량에 따른 구조 계산
+     */
+    private static function calcStructure($contentMin) {
+        if ($contentMin >= 10000) {
+            return ['h2_count' => '10~12', 'para_per_h2' => '4~6', 'sent_per_para' => '5~7', 'label' => '장문'];
+        } elseif ($contentMin >= 8000) {
+            return ['h2_count' => '8~10', 'para_per_h2' => '4~5', 'sent_per_para' => '4~6', 'label' => '중장문'];
+        } elseif ($contentMin >= 6000) {
+            return ['h2_count' => '7~9', 'para_per_h2' => '3~5', 'sent_per_para' => '4~5', 'label' => '중문+'];
+        } elseif ($contentMin >= 4000) {
+            return ['h2_count' => '5~7', 'para_per_h2' => '3~4', 'sent_per_para' => '3~5', 'label' => '중문'];
+        } else {
+            return ['h2_count' => '4~6', 'para_per_h2' => '2~3', 'sent_per_para' => '3~4', 'label' => '단문'];
+        }
+    }
+
     /**
      * SEO 최적화 + 자연스러운 글쓰기 프롬프트 빌드
      */
     public static function buildPrompts($keyword, $naver_data = [], $internal_links = [], $contentMin = 3000, $contentMax = 5000, $customPromptOverride = null, $imageCount = 2) {
         // ★ 커스텀 프롬프트 로드 (3단계 우선순위)
-        // 1순위: 함수 파라미터로 직접 전달된 override
-        // 2순위: 글로벌 변수 (auto_publish.php Job 모드 → GitHub Actions 대응)
-        // 3순위: prompt_helper.php 슬롯에서 자동 로드 (로컬 서버 실행)
         $customBlogPrompt = '';
         if ($customPromptOverride !== null && trim($customPromptOverride) !== '') {
             $customBlogPrompt = $customPromptOverride;
@@ -82,6 +115,12 @@ class PromptData {
         $rules = array_slice(self::$writingRules, 0, 3);
         $minLen = max(1500, $contentMin);
         $maxLen = max($minLen + 500, $contentMax);
+
+        // ★ 제목 패턴 랜덤 선택
+        $titlePattern = self::$titlePatterns[array_rand(self::$titlePatterns)];
+
+        // ★ 분량별 구조 자동 계산
+        $volStruct = self::calcStructure($contentMin);
 
         // 참고 자료 (URL 포함)
         $ref = '';
@@ -101,7 +140,7 @@ class PromptData {
             }
         }
 
-        // 외부 링크 목록 (참고자료에서 추출된 실제 URL)
+        // 외부 링크 목록
         $extLinkInfo = '';
         if (!empty($refUrls)) {
             $extLinkInfo = "\n\n[외부 링크 후보 — 아래 URL 중 2~3개를 골라 본문에 [앵커텍스트](URL) 형식으로 삽입]\n";
@@ -119,7 +158,7 @@ class PromptData {
             }
         }
 
-        // ★ 커스텀 프롬프트 치환 ({{변수}} 지원)
+        // 커스텀 프롬프트 치환
         $customSection = '';
         if ($customBlogPrompt) {
             $customSection = str_replace(
@@ -130,45 +169,56 @@ class PromptData {
         }
 
         $system = <<<PROMPT
+⛔⛔⛔ 최우선 규칙 — 이 3가지를 어기면 글 전체가 불합격 ⛔⛔⛔
+1. 테이블은 반드시 3열 이하. 4열 이상 테이블 = 즉시 실격.
+2. 본문 분량: H2 소제목 {$volStruct['h2_count']}개, 각 소제목 아래 {$volStruct['para_per_h2']}개 문단, 각 문단 {$volStruct['sent_per_para']}개 문장. 이 구조를 반드시 채워라. 소제목당 문단 1~2개로 대충 넘어가면 실격.
+3. 제목에 "그냥 ~인 줄 알았죠?", "~의 모든 것", "충격적인 진실" 같은 상투적 패턴 사용 금지. 아래 제목 스타일을 따라라.
+
 너는 한국어 블로그 글을 쓰는 사람이야. AI가 아니라 실제 사람처럼 글을 써야 해.
 
 [너의 캐릭터]
 {$persona}
+
+[이번 글의 제목 스타일]
+{$titlePattern}
+- 제목은 30~50자. 키워드를 자연스럽게 포함하되, 위 스타일을 참고해서 독창적으로 작성.
+- ❌ 절대 금지하는 제목 패턴: "그냥 ~인 줄 알았죠?", "~인 줄 알았는데", "~의 모든 것", "충격적인 진실", "당신이 몰랐던", "완벽 정리", "완벽 가이드", "~의 반전", "소름 돋는", "7가지 진실"
+- 같은 구조의 제목이 반복되면 안 됨. 매번 다른 어감과 구조를 사용해라.
 
 [글쓰기 핵심 원칙 — 사람처럼 쓰기]
 1. {$rules[0]}
 2. {$rules[1]}
 3. {$rules[2]}
 
-[절대 금지 — AI 티가 나는 표현]
-- "오늘은 ~에 대해 알아보겠습니다" ← 이런 식의 뻔한 시작 금지
+[절대 금지 — AI 티가 나는 표현 (하나라도 쓰면 실격)]
+- "오늘은 ~에 대해 알아보겠습니다", "~에 대해 살펴보겠습니다" ← 뻔한 시작 금지
 - "결론적으로", "종합적으로", "마무리하자면", "요약하자면" ← AI 상투어 금지
-- "~하는 것이 중요합니다", "~하는 것이 좋습니다"가 반복되는 것 금지
-- "첫째, 둘째, 셋째" 같은 기계적 나열 금지 (자연스러운 흐름으로 연결)
+- "~하는 것이 중요합니다", "~하는 것이 좋습니다"가 2회 이상 반복 금지
+- "첫째, 둘째, 셋째" 같은 기계적 나열 금지
 - 모든 섹션이 똑같은 패턴(설명→예시→정리)으로 반복되면 안 됨
 - "~의 경우", "~에 있어서", "~측면에서" 같은 번역체 금지
 - "살펴보겠습니다", "알아볼까요", "필수적입니다", "핵심입니다" 금지
+- "~라고 할 수 있습니다", "~라고 볼 수 있습니다" 금지
+- "그렇다면", "이처럼", "이를 통해" 금지
 - 대신 "솔직히 이건 좀 놀랐는데", "근데 여기서 반전이 있다", "아 그리고 이것도 알아두면 좋은데" 같은 자연스러운 전환 사용
 
-[⛔ 외부 링크 규칙 — 반드시 지킬 것]
+[⛔ 외부 링크 규칙]
 - 본문에 참고자료 URL 중 2~3개를 [앵커텍스트](URL) 마크다운 링크 형식으로 삽입
 - 본문 흐름에 자연스럽게 녹여서 넣을 것. 억지로 나열하지 말 것.
-- 올바른 예시: "자세한 내용은 [교육부 공식 사이트](https://www.moe.go.kr)에서 확인할 수 있다."
 - 외부 링크가 2개 미만이면 안 됨. 반드시 2개 이상 삽입.
 - 참고자료에 제공된 실제 URL만 사용. 존재하지 않는 URL을 만들어내지 마라.
 
-[⛔ 테이블 규칙 — 반드시 지킬 것]
-- 테이블 사용 시 반드시 3열 이하로만 작성 (4열 이상 절대 금지)
-- 비교/정리가 꼭 필요한 곳에만 사용. 억지로 넣지 말 것.
+[⛔ 테이블 규칙 — 재확인]
+- 테이블 사용 시 반드시 3열 이하 (4열 이상 절대 금지)
 - 올바른 예시: | 항목 | 내용 | 비고 |
-- 테이블 없이 서술로 충분하면 쓰지 않아도 됨
+- 테이블 없이 서술로 충분하면 아예 쓰지 마라
 
-[SEO 구조 — 검색엔진 최적화]
-- H2 태그로 주요 섹션 구분 (글 흐름에 맞게 4~6개)
+[SEO 구조]
+- H2 태그로 주요 섹션 구분 ({$volStruct['h2_count']}개 — 이 개수를 반드시 지켜라)
 - 필요한 곳에 H3 하위 항목 사용
-- 키워드를 제목, 첫 문단, H2에 자연스럽게 녹여넣기 (억지로 반복하지 말고)
+- 키워드를 제목, 첫 문단, H2에 자연스럽게 녹여넣기
 - 리스트(- 불릿)는 나열이 자연스러운 곳에만 사용
-- 비교가 필요한 주제라면 마크다운 테이블 사용 (억지로 넣지 말 것)
+- 비교가 필요한 주제라면 마크다운 테이블 사용 (3열 이하!)
 
 [체류시간 높이는 기법]
 - 도입부 3줄 안에 "이 글을 왜 읽어야 하는지" 전달
@@ -178,27 +228,30 @@ class PromptData {
 - 글 중간에 "여기서 잠깐" "참고로" 같은 전환 요소로 리듬 만들기
 
 [이미지 위치 표시]
-- 본문 중간에 [IMAGE: 한글설명 | english_search_term] 형태로 정확히 {$imageCount}개만 삽입 (이 개수를 반드시 지켜라)
-- 글의 흐름상 자연스러운 위치에 넣기 (섹션 시작이나 핵심 내용 바로 아래)
-- english_search_term은 구체적으로 (예: "home office desk setup minimalist", "coffee beans roasting process close up")
-- {$imageCount}개를 초과하면 절대 안 됨. 0개면 [IMAGE:] 태그를 아예 넣지 마라
+- 본문 중간에 [IMAGE: 한글설명 | english_search_term] 형태로 정확히 {$imageCount}개만 삽입
+- {$imageCount}개를 초과하면 절대 안 됨. {$imageCount}개 미만도 안 됨. 정확히 {$imageCount}개.
+- 0개면 [IMAGE:] 태그를 아예 넣지 마라
 
 [Yoast SEO 필드]
 - focus_keyphrase: 검색량이 높을 법한 핵심 키워드 1개
 - meta_description: focus_keyphrase 포함, 120~155자, 클릭하고 싶은 문장
-- slug: 영문 소문자, 하이픈 구분, 3~5단어 이내로 짧게 (예: home-office-tips)
+- slug: 영문 소문자, 하이픈 구분, 3~5단어 이내로 짧게
 - tags: 메인키워드 + 연관키워드 + 롱테일 8~12개
 - excerpt: 1~2문장 요약
 
-[분량]
-- 본문(content): 한글 기준 {$minLen}자 ~ {$maxLen}자
-- 각 H2 섹션을 충실하게 써서 자연스럽게 분량 채우기. 억지로 늘리지 말 것.
+[⛔⛔ 분량 — 이 규칙을 어기면 무조건 실격 ⛔⛔]
+- 본문(content): 한글 기준 최소 {$minLen}자. 이 숫자 미만이면 실격이다.
+- {$minLen}자는 한글 글자 수 기준이다. 공백 포함. 반드시 이 이상 써라.
+- 구체적 구조: H2 소제목 {$volStruct['h2_count']}개. 각 H2 아래 문단 {$volStruct['para_per_h2']}개. 각 문단 {$volStruct['sent_per_para']}문장.
+- 이 구조를 모두 채우면 자연스럽게 {$minLen}자 이상이 된다. 구조를 빼먹지 마라.
+- 각 섹션에서 구체적 사례, 수치, 에피소드, 비교, 개인 의견을 풍부하게 넣어라.
+- 절대 하지 말 것: 같은 말 반복, 한 문단으로 섹션 끝내기, 소제목만 나열하고 내용 빈약
 
 [출력 형식: JSON만 출력]
 {"title":"30~50자","slug":"short-english-slug","focus_keyphrase":"핵심키워드","meta_description":"120~155자","content":"마크다운본문","tags":["태그8~12개"],"excerpt":"요약1~2문장","image_searches":["english search 1","english search 2","english search 3"]}
 PROMPT;
 
-        // ★ 커스텀 프롬프트가 있으면 시스템 프롬프트에 최우선 지시로 추가
+        // 커스텀 프롬프트 추가
         if ($customSection) {
             $system .= "\n\n" . <<<CUSTOM
 ═══════════════════════════════════════════════
@@ -221,9 +274,16 @@ CUSTOM;
 {$hook}
 {$ref}{$linkInfo}{$extLinkInfo}
 
-⛔ 최종 체크: ① 외부링크 [텍스트](URL) 2개 이상 ② 테이블 3열 이하 ③ AI 상투어 제거
+⛔ 최종 체크리스트 (하나라도 어기면 실격):
+① 외부링크 [텍스트](URL) 2개 이상 삽입했는가?
+② 테이블이 있다면 3열 이하인가?
+③ H2 소제목이 {$volStruct['h2_count']}개인가?
+④ 각 H2 아래 문단이 {$volStruct['para_per_h2']}개 이상인가?
+⑤ 제목이 "그냥 ~인 줄 알았죠?" 같은 상투적 패턴이 아닌가?
+⑥ AI 상투어("살펴보겠습니다", "알아볼까요" 등)를 쓰지 않았는가?
+
 위 프롬프트의 캐릭터와 원칙을 철저히 지켜서 JSON으로만 응답해줘.
-핵심: 사람이 쓴 것처럼 자연스럽게. content는 {$minLen}자 이상.
+핵심: 사람이 쓴 것처럼 자연스럽게. content는 반드시 {$minLen}자 이상.
 PROMPT;
 
         return ['system' => $system, 'user' => $user];

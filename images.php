@@ -18,6 +18,7 @@ class StockImageSearch {
         $keys = loadApiKeys();
         $imgSettings = $keys['image_source'] ?? [];
         $priority = $imgSettings['priority'] ?? ['pixabay', 'pexels', 'gradient'];
+        write_log("🔍 이미지 검색어: \"{$query}\" (type: {$type})");
 
         // 1) 우선순위 소스 시도 (gradient 제외)
         $tried = [];
@@ -64,10 +65,10 @@ class StockImageSearch {
         if (!$apiKey) return null;
 
         $minW = $type === 'thumbnail' ? 1200 : 800;
-        // 사람 제외: 검색어 보강
-        $searchQuery = $query . ' flat lay product closeup';
+        // ★ 검색어를 그대로 사용 (접미사 추가하면 관련 없는 이미지 반환됨)
+        // 사람 제외는 Pixabay API 파라미터로 처리
         $url = 'https://pixabay.com/api/?' . http_build_query([
-            'key' => $apiKey, 'q' => $searchQuery, 'image_type' => 'photo',
+            'key' => $apiKey, 'q' => $query, 'image_type' => 'photo',
             'orientation' => 'horizontal', 'min_width' => $minW,
             'safesearch' => 'true', 'per_page' => 15, 'lang' => 'en',
         ]);
@@ -79,6 +80,25 @@ class StockImageSearch {
 
         $data = json_decode($resp, true);
         $hits = $data['hits'] ?? [];
+        
+        // ★ 결과 없으면 검색어 단순화해서 재시도 (단어 수 줄이기)
+        if (empty($hits)) {
+            $words = explode(' ', $query);
+            if (count($words) > 2) {
+                $shortQuery = implode(' ', array_slice($words, 0, 2));
+                write_log("Pixabay 결과 없음 → 검색어 단순화: \"{$shortQuery}\"");
+                $retryUrl = 'https://pixabay.com/api/?' . http_build_query([
+                    'key' => $apiKey, 'q' => $shortQuery, 'image_type' => 'photo',
+                    'orientation' => 'horizontal', 'min_width' => $minW,
+                    'safesearch' => 'true', 'per_page' => 15, 'lang' => 'en',
+                ]);
+                $ch = curl_init($retryUrl);
+                curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 15]);
+                $resp2 = curl_exec($ch); curl_close($ch);
+                $data2 = json_decode($resp2, true);
+                $hits = $data2['hits'] ?? [];
+            }
+        }
         if (empty($hits)) return null;
 
         // 랜덤 선택 (상위 5개 중)
@@ -97,7 +117,7 @@ class StockImageSearch {
         if (!$apiKey) return null;
 
         $url = 'https://api.pexels.com/v1/search?' . http_build_query([
-            'query' => $query . ' object closeup no people', 'orientation' => 'landscape',
+            'query' => $query, 'orientation' => 'landscape',
             'size' => 'large', 'per_page' => 15,
         ]);
 
@@ -111,6 +131,27 @@ class StockImageSearch {
 
         $data = json_decode($resp, true);
         $photos = $data['photos'] ?? [];
+        
+        // ★ 결과 없으면 검색어 단순화해서 재시도
+        if (empty($photos)) {
+            $words = explode(' ', $query);
+            if (count($words) > 2) {
+                $shortQuery = implode(' ', array_slice($words, 0, 2));
+                write_log("Pexels 결과 없음 → 검색어 단순화: \"{$shortQuery}\"");
+                $retryUrl = 'https://api.pexels.com/v1/search?' . http_build_query([
+                    'query' => $shortQuery, 'orientation' => 'landscape',
+                    'size' => 'large', 'per_page' => 15,
+                ]);
+                $ch = curl_init($retryUrl);
+                curl_setopt_array($ch, [
+                    CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 15,
+                    CURLOPT_HTTPHEADER => ['Authorization: ' . $apiKey],
+                ]);
+                $resp2 = curl_exec($ch); curl_close($ch);
+                $data2 = json_decode($resp2, true);
+                $photos = $data2['photos'] ?? [];
+            }
+        }
         if (empty($photos)) return null;
 
         $pick = $photos[array_rand(array_slice($photos, 0, min(5, count($photos))))];
@@ -150,27 +191,29 @@ class StockImageSearch {
 
         $size = $type === 'thumbnail' ? '1200x630' : '800x400';
 
+        // ★ v3: 게시글 제목이 있으면 이미지 context에 추가
+        $titleContext = '';
+        if (!empty($this->_currentTitle)) {
+            $titleContext = " The blog post title is: \"{$this->_currentTitle}\". Make the image relevant to this topic.";
+        }
+
         // Imagen 모델은 다른 API 엔드포인트 사용
         if (str_starts_with($imageModel, 'imagen')) {
-            return $this->fromImagen($apiKey, $imageModel, $query, $type);
+            return $this->fromImagen($apiKey, $imageModel, $query, $type, $titleContext);
         }
 
         $url = "https://generativelanguage.googleapis.com/v1beta/models/{$imageModel}:generateContent?key={$apiKey}";
 
-        // 스타일 다양화 - 매번 다른 느낌의 이미지
+        // 스타일 다양화 - 사실적 사진 스타일 위주 (v3)
         $styles = [
-            'Minimalist flat illustration with clean vector shapes, soft pastel colors, modern design',
-            'Watercolor painting style with soft brush strokes, artistic and elegant feel',
-            'Isometric 3D illustration with vibrant colors and clean geometric shapes',
-            'Cinematic wide-angle photography style, dramatic lighting, professional composition',
-            'Abstract geometric art with bold shapes, gradients, and modern color palette',
-            'Paper cut-out layered illustration with depth and soft shadows',
-            'Infographic style with icons and visual elements, clean professional layout',
-            'Retro vintage poster design with warm tones and classic typography feel',
-            'Modern editorial photography style, clean background, professional product shot',
-            'Digital art with smooth gradients, floating elements, dreamy atmosphere',
-            'Scandinavian minimal design with muted tones and organic shapes',
-            'Tech-inspired design with circuit patterns, holographic accents, futuristic feel',
+            'Professional stock photography, natural lighting, sharp focus, realistic details, high resolution',
+            'Cinematic wide-angle photography, dramatic natural lighting, shallow depth of field, photorealistic',
+            'Editorial magazine photography, clean composition, studio-quality lighting, realistic textures',
+            'Documentary-style photography, candid feel, natural colors, authentic atmosphere',
+            'High-end commercial photography, product-shot quality, soft diffused lighting, crisp details',
+            'Lifestyle photography, warm natural tones, cozy atmosphere, realistic setting',
+            'Modern photojournalism style, vivid colors, dynamic composition, real-world context',
+            'Fine art photography, golden hour lighting, rich colors, professional DSLR quality',
         ];
         $chosenStyle = $styles[array_rand($styles)];
 
@@ -179,7 +222,7 @@ class StockImageSearch {
             CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_TIMEOUT => 60,
             CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
             CURLOPT_POSTFIELDS => json_encode([
-                'contents' => [['parts' => [['text' => "Create a blog header image about: {$query}. Style: {$chosenStyle}. NO text, NO letters, NO words in the image. NO people, NO faces, NO hands. Only visual elements and objects. Horizontal {$size} ratio. High quality."]]]],
+                'contents' => [['parts' => [['text' => "Create a realistic, photographic blog image about: {$query}.{$titleContext} Style: {$chosenStyle}. NO text, NO letters, NO words, NO watermarks in the image. Horizontal {$size} ratio. Ultra high quality, photorealistic."]]]],
                 'generationConfig' => ['responseModalities' => ['IMAGE', 'TEXT'], 'maxOutputTokens' => 2048],
             ]),
         ]);
@@ -210,15 +253,20 @@ class StockImageSearch {
     /**
      * Google Imagen 이미지 생성
      */
-    private function fromImagen($apiKey, $model, $query, $type) {
+    private function fromImagen($apiKey, $model, $query, $type, $titleContext = '') {
         $url = "https://generativelanguage.googleapis.com/v1beta/models/{$model}:predict?key={$apiKey}";
+        // 사실적 사진 스타일 (v3)
         $styles = [
-            'minimalist flat illustration', 'watercolor painting', 'isometric 3D art',
-            'cinematic photography', 'abstract geometric', 'paper cut-out layers',
-            'modern editorial', 'digital art with gradients', 'retro vintage poster',
+            'professional stock photography, realistic, sharp details',
+            'cinematic photography, natural lighting, photorealistic',
+            'editorial magazine photo, studio quality, crisp',
+            'lifestyle photography, warm natural tones, authentic',
+            'high-end commercial photo, clean composition, vivid colors',
+            'documentary photography, candid, natural atmosphere',
+            'fine art photography, golden hour, DSLR quality',
         ];
         $chosenStyle = $styles[array_rand($styles)];
-        $prompt = "A {$chosenStyle} blog image about: {$query}. NO text, NO letters, NO people, NO faces, NO hands. Only visual elements. High quality, professional.";
+        $prompt = "A {$chosenStyle} blog image about: {$query}.{$titleContext} NO text, NO letters, NO watermarks. Photorealistic, high quality, professional.";
 
         $ch = curl_init($url);
         curl_setopt_array($ch, [
@@ -604,14 +652,36 @@ class ImageGenerator {
     }
 
     /**
-     * 썸네일: 스톡 이미지 우선, 없으면 다양한 그라데이션
+     * 썸네일: AI 배경 이미지 생성 + PHP GD 제목 텍스트 오버레이 (v4)
+     * 1차: AI로 배경 이미지 생성 → 텍스트 오버레이
+     * 2차: 스톡 이미지 검색 → 텍스트 오버레이
+     * 3차: 그라데이션 폴백
      */
     public function createThumbnail($title, $keyword = '') {
         $query = $keyword ?: $this->korToSearchTerm($title);
-        $stockPath = $this->stock->search($query, 'thumbnail');
-        if ($stockPath) return $stockPath;
-
-        write_log("스톡 이미지 없음 → 그라데이션 썸네일");
+        $this->_currentTitle = $title;
+        
+        // 1차: AI 이미지로 배경 생성 시도
+        $bgPath = null;
+        $apiKey = getKey('gemini.api_key');
+        $imageModel = getKey('gemini.image_model', '');
+        if ($apiKey && $imageModel) {
+            $bgPath = $this->fromGemini($query, 'thumbnail');
+        }
+        
+        // 2차: 스톡 이미지 폴백
+        if (!$bgPath) {
+            $bgPath = $this->stock->search($query, 'thumbnail');
+        }
+        
+        // 배경 이미지가 있으면 텍스트 오버레이
+        if ($bgPath && file_exists($bgPath)) {
+            $overlaid = $this->overlayTextOnImage($bgPath, $title);
+            if ($overlaid) return $overlaid;
+        }
+        
+        // 3차: 그라데이션 폴백
+        write_log("배경 이미지 없음 → 그라데이션 썸네일");
         $w=1200; $h=630;
         $pal = $this->getRandomPalette();
         $img = imagecreatetruecolor($w, $h);
@@ -621,6 +691,101 @@ class ImageGenerator {
         $this->drawOverlay($img, $w, $h);
         $this->text($img, $title, $w, $h, imagecolorallocate($img, 255, 255, 255), 28);
         return $this->saveGradient($img, 'thumb');
+    }
+
+    /**
+     * 배경 이미지 위에 제목 텍스트 오버레이 (뉴스 썸네일 스타일)
+     */
+    private function overlayTextOnImage($bgPath, $title) {
+        $w = 1200; $h = 630;
+        
+        // 배경 이미지 로드
+        $ext = strtolower(pathinfo($bgPath, PATHINFO_EXTENSION));
+        switch ($ext) {
+            case 'jpg': case 'jpeg': $bg = @imagecreatefromjpeg($bgPath); break;
+            case 'png': $bg = @imagecreatefrompng($bgPath); break;
+            case 'webp': $bg = function_exists('imagecreatefromwebp') ? @imagecreatefromwebp($bgPath) : null; break;
+            default: $bg = null;
+        }
+        if (!$bg) return null;
+        
+        // 1200x630으로 리사이즈
+        $srcW = imagesx($bg); $srcH = imagesy($bg);
+        $canvas = imagecreatetruecolor($w, $h);
+        imagecopyresampled($canvas, $bg, 0, 0, 0, 0, $w, $h, $srcW, $srcH);
+        imagedestroy($bg);
+        
+        // 하단 그라데이션 오버레이 (텍스트 가독성)
+        for ($y = (int)($h * 0.35); $y < $h; $y++) {
+            $alpha = (int)(($y - $h * 0.35) / ($h * 0.65) * 100);
+            $alpha = min(100, $alpha);
+            $overlay = imagecolorallocatealpha($canvas, 0, 0, 0, 127 - (int)($alpha * 1.1));
+            imageline($canvas, 0, $y, $w, $y, $overlay);
+        }
+        
+        // 폰트 확인
+        $fontPath = defined('FONT_PATH') ? FONT_PATH : (__DIR__ . '/fonts/NanumGothicBold.ttf');
+        if (!file_exists($fontPath)) {
+            write_log("⚠️ 폰트 없음: {$fontPath}");
+            imagedestroy($canvas);
+            return null;
+        }
+        
+        // 제목 텍스트 줄바꿈 처리 (한 줄 최대 16자)
+        $maxCharsPerLine = 16;
+        $titleLines = [];
+        $remaining = $title;
+        while (mb_strlen($remaining) > 0) {
+            if (mb_strlen($remaining) <= $maxCharsPerLine) {
+                $titleLines[] = $remaining;
+                break;
+            }
+            $line = mb_substr($remaining, 0, $maxCharsPerLine);
+            // 단어 중간 끊김 방지 (공백/쉼표/마침표에서 끊기)
+            $lastSpace = mb_strrpos($line, ' ');
+            $lastComma = mb_strrpos($line, ',');
+            $breakPos = max($lastSpace ?: 0, $lastComma ?: 0);
+            if ($breakPos > $maxCharsPerLine * 0.4) {
+                $line = mb_substr($remaining, 0, $breakPos + 1);
+            }
+            $titleLines[] = trim($line);
+            $remaining = trim(mb_substr($remaining, mb_strlen($line)));
+        }
+        // 최대 3줄
+        $titleLines = array_slice($titleLines, 0, 3);
+        
+        // 텍스트 렌더링
+        $fontSize = 42;
+        $lineHeight = (int)($fontSize * 1.6);
+        $totalTextH = count($titleLines) * $lineHeight;
+        $startY = $h - $totalTextH - 40; // 하단에서 40px 위
+        
+        $white = imagecolorallocate($canvas, 255, 255, 255);
+        $shadow = imagecolorallocate($canvas, 0, 0, 0);
+        
+        foreach ($titleLines as $i => $line) {
+            $bbox = imagettfbbox($fontSize, 0, $fontPath, $line);
+            $textW = $bbox[2] - $bbox[0];
+            $x = 50; // 왼쪽 정렬, 50px 마진
+            $y = $startY + ($i * $lineHeight) + $fontSize;
+            
+            // 그림자
+            imagettftext($canvas, $fontSize, 0, $x + 2, $y + 2, $shadow, $fontPath, $line);
+            imagettftext($canvas, $fontSize, 0, $x + 1, $y + 1, $shadow, $fontPath, $line);
+            // 본문
+            imagettftext($canvas, $fontSize, 0, $x, $y, $white, $fontPath, $line);
+        }
+        
+        // 저장
+        $path = IMAGE_SAVE_DIR . 'thumb_overlay_' . time() . '_' . mt_rand(1000,9999) . '.jpg';
+        imagejpeg($canvas, $path, 92);
+        imagedestroy($canvas);
+        
+        // 원본 배경 이미지 삭제 (임시 파일)
+        @unlink($bgPath);
+        
+        write_log("🖼️ 썸네일 생성: AI 배경 + 텍스트 오버레이");
+        return $path;
     }
 
     private function createGradientSection($text) {
@@ -669,7 +834,7 @@ class ImageGenerator {
                 $p = $this->createGradientSection($altText);
             }
             $paths[] = $p;
-            return "<!-- wp:image {\"align\":\"center\",\"sizeSlug\":\"large\"} -->\n<figure class=\"wp-block-image aligncenter size-large\" style=\"max-width:1080px;margin:28px auto;\"><img src=\"{$p}\" alt=\"".htmlspecialchars($altText)."\" style=\"width:100%;height:auto;display:block;\"/></figure>\n<!-- /wp:image -->";
+            return "<!-- wp:image {\"align\":\"center\",\"sizeSlug\":\"large\"} -->\n<figure class=\"wp-block-image aligncenter size-large\" style=\"max-width:1080px;margin:12px auto;\"><img src=\"{$p}\" alt=\"".htmlspecialchars($altText)."\" style=\"width:100%;height:auto;display:block;\"/></figure>\n<!-- /wp:image -->";
         }, $html);
         return ['content'=>$html, 'images'=>$paths];
     }
@@ -718,7 +883,7 @@ class ImageGenerator {
             $altText = trim(explode('|', $m[1])[0]);
             $paths[] = $p;
             write_log("로컬 이미지 삽입: " . basename($p) . " (alt: {$altText})");
-            return "<!-- wp:image {\"align\":\"center\",\"sizeSlug\":\"large\"} -->\n<figure class=\"wp-block-image aligncenter size-large\" style=\"max-width:1080px;margin:28px auto;\"><img src=\"{$p}\" alt=\"".htmlspecialchars($altText)."\" style=\"width:100%;height:auto;display:block;\"/></figure>\n<!-- /wp:image -->";
+            return "<!-- wp:image {\"align\":\"center\",\"sizeSlug\":\"large\"} -->\n<figure class=\"wp-block-image aligncenter size-large\" style=\"max-width:1080px;margin:12px auto;\"><img src=\"{$p}\" alt=\"".htmlspecialchars($altText)."\" style=\"width:100%;height:auto;display:block;\"/></figure>\n<!-- /wp:image -->";
         }, $html);
 
         // 2단계: 이미지가 더 남았으면 H2 태그 사이에 자동 삽입
@@ -741,7 +906,7 @@ class ImageGenerator {
                     if ($usedIdx >= count($available)) break;
                     $p = $available[$usedIdx++];
                     $paths[] = $p;
-                    $imgHtml = "\n<!-- wp:image {\"align\":\"center\",\"sizeSlug\":\"large\"} -->\n<figure class=\"wp-block-image aligncenter size-large\" style=\"max-width:1080px;margin:28px auto;\"><img src=\"{$p}\" alt=\"".htmlspecialchars($keyword)."\" style=\"width:100%;height:auto;display:block;\"/></figure>\n<!-- /wp:image -->\n";
+                    $imgHtml = "\n<!-- wp:image {\"align\":\"center\",\"sizeSlug\":\"large\"} -->\n<figure class=\"wp-block-image aligncenter size-large\" style=\"max-width:1080px;margin:12px auto;\"><img src=\"{$p}\" alt=\"".htmlspecialchars($keyword)."\" style=\"width:100%;height:auto;display:block;\"/></figure>\n<!-- /wp:image -->\n";
                     $html = substr($html, 0, $pos) . $imgHtml . substr($html, $pos);
                     write_log("로컬 이미지 자동 삽입: " . basename($p));
                 }
@@ -786,29 +951,60 @@ class ImageGenerator {
     }
 
     /**
-     * 한글 → 영문 검색어 간단 변환 (키워드 기반)
+     * 한글 → 영문 검색어 변환 (키워드 기반)
+     * ★ 매핑 안 되면 한글에서 핵심 단어를 추출하여 검색어로 활용
      */
     private function korToSearchTerm($text) {
         // 일반적인 한국어 블로그 키워드 → 영문 매핑
         $map = [
-            '노트북'=>'laptop', '컴퓨터'=>'computer', '스마트폰'=>'smartphone', '아이폰'=>'iphone',
-            '갤럭시'=>'galaxy phone', '건강'=>'health', '다이어트'=>'diet', '운동'=>'exercise fitness',
-            '음식'=>'food', '식단'=>'meal plan', '요리'=>'cooking', '여행'=>'travel',
-            '서울'=>'seoul', '카페'=>'cafe', '맛집'=>'restaurant', '투자'=>'investment',
-            '주식'=>'stock market', '부동산'=>'real estate', '재테크'=>'finance',
-            '프리랜서'=>'freelancer', '유튜브'=>'youtube', '블로그'=>'blogging',
-            '강아지'=>'dog puppy', '고양이'=>'cat', '반려동물'=>'pet', '육아'=>'parenting',
-            '교육'=>'education', '영어'=>'english learning', '코딩'=>'coding programming',
-            '자동차'=>'car automobile', '패션'=>'fashion style', '뷰티'=>'beauty skincare',
-            '인테리어'=>'interior design', '이사'=>'moving house', '결혼'=>'wedding',
-            '취업'=>'job career', '면접'=>'job interview', '이직'=>'career change',
-            '약국'=>'pharmacy medicine', '병원'=>'hospital medical', '보험'=>'insurance',
+            '노트북'=>'laptop computer', '컴퓨터'=>'computer desktop', '스마트폰'=>'smartphone', '아이폰'=>'iphone',
+            '갤럭시'=>'galaxy phone', '건강'=>'health wellness', '다이어트'=>'healthy diet food', '운동'=>'exercise fitness gym',
+            '음식'=>'food cooking', '식단'=>'meal preparation', '요리'=>'cooking kitchen', '여행'=>'travel landscape',
+            '서울'=>'seoul city', '카페'=>'coffee cafe interior', '맛집'=>'restaurant food', '투자'=>'investment finance',
+            '주식'=>'stock market trading', '부동산'=>'real estate house', '재테크'=>'personal finance money',
+            '프리랜서'=>'freelancer workspace', '유튜브'=>'video content creator', '블로그'=>'blogging writing',
+            '강아지'=>'dog puppy cute', '고양이'=>'cat kitten', '반려동물'=>'pet animal', '육아'=>'parenting baby',
+            '교육'=>'education learning', '영어'=>'english language study', '코딩'=>'coding programming laptop',
+            '자동차'=>'car automobile', '패션'=>'fashion clothing style', '뷰티'=>'beauty skincare cosmetics',
+            '인테리어'=>'interior design room', '이사'=>'moving new home', '결혼'=>'wedding ceremony',
+            '취업'=>'job career office', '면접'=>'job interview', '이직'=>'career change',
+            '약국'=>'pharmacy medicine', '병원'=>'hospital medical', '보험'=>'insurance document',
+            '커피'=>'coffee beans brewing', '독서'=>'books reading library', '공부'=>'studying desk',
+            '피부'=>'skincare beauty', '치과'=>'dental care', '안과'=>'eye care',
+            '캠핑'=>'camping outdoor nature', '등산'=>'hiking mountain', '낚시'=>'fishing lake',
+            '사진'=>'photography camera', '그림'=>'painting art', '음악'=>'music instrument',
+            '수면'=>'sleep bedroom', '스트레스'=>'stress relief relaxation', '명상'=>'meditation mindfulness',
+            '비타민'=>'vitamins supplements', '단백질'=>'protein nutrition', '채소'=>'vegetables fresh',
+            '과일'=>'fruit fresh colorful', '디저트'=>'dessert cake sweet', '빵'=>'bread bakery',
+            '차'=>'tea ceremony', '와인'=>'wine glass bottle', '맥주'=>'craft beer',
+            '집'=>'home house interior', '아파트'=>'apartment building', '전세'=>'housing real estate',
+            '세금'=>'tax document calculator', '연말정산'=>'tax return document', '급여'=>'salary paycheck',
+            '창업'=>'startup business', '마케팅'=>'marketing strategy', '브랜딩'=>'branding design',
+            '정리'=>'organization tidy', '청소'=>'cleaning home', '수납'=>'storage organization',
+            '식물'=>'plant indoor green', '정원'=>'garden flowers', '꽃'=>'flowers bouquet',
         ];
         foreach ($map as $kr => $en) {
             if (mb_strpos($text, $kr) !== false) return $en;
         }
-        // 매핑 안 되면 일반적인 단어 사용
-        return 'professional business lifestyle';
+        
+        // ★ 매핑 안 되면 한글 텍스트에서 의미 있는 단어를 추출
+        // 조사/접미사 등을 제거하고 핵심 명사만 남기기
+        $cleaned = preg_replace('/[은는이가을를에서의로도만요\s]+/u', ' ', $text);
+        $cleaned = trim($cleaned);
+        
+        // 한글이 포함된 경우 → 그대로 Pixabay/Pexels에 넘기면 결과 없음
+        // 최소한의 컨텍스트라도 전달
+        if (preg_match('/[가-힣]/u', $cleaned)) {
+            // 한글만 있으면 generic하지만 주제와 약간이라도 관련된 검색어
+            return 'concept illustration abstract';
+        }
+        
+        // 영문이 포함된 경우 → 그대로 사용
+        if (preg_match('/[a-zA-Z]{3,}/', $cleaned)) {
+            return $cleaned;
+        }
+        
+        return 'concept illustration abstract';
     }
 
     private function text($img,$text,$w,$h,$color,$size) {

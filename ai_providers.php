@@ -458,44 +458,107 @@ class AIRouter {
 
     /**
      * 특정 AI 프로바이더로 직접 생성
+     * ★ v7: 실패 시 같은 플랫폼 내에서만 1회 재시도 (다른 플랫폼으로 절대 넘어가지 않음)
+     *   1차: 같은 모델로 재시도 (타임아웃/일시 장애 대응)
+     *   2차: 같은 플랫폼의 대체 모델로 시도 (모델 고장 대응)
+     *   그래도 실패 → 글 생성 중단 (다른 AI 플랫폼으로 폴백 안 함)
      */
     public function generateWithProvider($keyword, $providerKey, $naver_data = [], $internal_links = [], $contentMin = 3000, $contentMax = 5000, $imageCount = 2) {
         $providerMap = ['claude'=>new ClaudeProvider(),'grok'=>new GrokProvider(),'chatgpt'=>new ChatGPTProvider(),'gemini'=>new GeminiProvider()];
         $provider = $providerMap[$providerKey] ?? null;
 
         if (!$provider || !$provider->isConfigured()) {
-            write_log("{$providerKey} 사용 불가 → 로테이션 폴백");
-            return $this->generateBlogPost($keyword, $naver_data, $internal_links, false, $contentMin, $contentMax, $imageCount);
+            write_log("⚠️ {$providerKey} 사용 불가 (미설정 또는 '사용 안 함') → 글 생성 중단");
+            write_log("💡 설정 확인: api_keys.json에서 {$providerKey}.model 값을 확인하세요");
+            return null;
         }
         if (!checkAiDailyLimit($providerKey)) {
-            write_log("{$providerKey} 한도 초과 → 로테이션 폴백");
-            return $this->generateBlogPost($keyword, $naver_data, $internal_links, false, $contentMin, $contentMax, $imageCount);
+            write_log("⚠️ {$providerKey} 일일 한도 초과 → 글 생성 중단");
+            return null;
         }
 
         $prompts = PromptData::buildPrompts($keyword, $naver_data, $internal_links, $contentMin, $contentMax, null, $imageCount);
-        // ★ v4: maxTokens 대폭 상향
         $maxTokens = max(16384, min(65536, (int)($contentMax * 3.5) + 4000));
-        write_log("AI 호출: {$provider->getName()} (지정) [max_tokens:{$maxTokens}, 목표:{$contentMin}~{$contentMax}자]");
+        $originalModel = getKey("{$providerKey}.model");
 
-        $response = $provider->callAPI($prompts['system'], $prompts['user'], $maxTokens);
-        if ($response) {
-            $data = $this->parseJSON($response);
-            if ($data) {
-                $data['content_html'] = $this->mdToHtml($data['content']);
-                $data['_provider'] = $providerKey;
-                write_log("{$provider->getName()} 글 생성 완료: {$data['title']}");
-                incrementAiDailyCount($providerKey);
-                $usage = $provider->getLastUsage();
-                if ($usage['input'] > 0 || $usage['output'] > 0) {
-                    $cost = trackAiCost($providerKey, $usage['input'], $usage['output']);
-                    write_log(sprintf("토큰: in=%d out=%d | 비용: $%.4f", $usage['input'], $usage['output'], $cost));
-                }
-                return $data;
+        // ── 플랫폼별 대체 모델 목록 (현재 모델 제외, 저비용→고비용 순) ──
+        $fallbackModels = [
+            'gemini'  => ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro'],
+            'grok'    => ['grok-3-mini-fast', 'grok-3-mini', 'grok-4-1-fast', 'grok-4-fast', 'grok-3', 'grok-4'],
+            'chatgpt' => ['gpt-5.4-mini', 'gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o', 'gpt-4.1'],
+            'claude'  => ['claude-haiku-4-5-20251001', 'claude-sonnet-4-5-20250929'],
+        ];
+
+        // ── 시도 1: 원래 모델로 호출 ──
+        write_log("AI 호출: {$provider->getName()} (지정) [모델:{$originalModel}, max_tokens:{$maxTokens}]");
+        $result = $this->tryCallAndParse($provider, $providerKey, $prompts, $maxTokens);
+        if ($result) return $result;
+
+        // ── 시도 2: 같은 모델로 10초 후 재시도 (타임아웃/일시장애 대응) ──
+        write_log("🔄 {$providerKey} 1차 실패 → 같은 모델({$originalModel})로 10초 후 재시도...");
+        sleep(10);
+        $result = $this->tryCallAndParse($provider, $providerKey, $prompts, $maxTokens);
+        if ($result) return $result;
+
+        // ── 시도 3: 같은 플랫폼의 대체 모델로 1회 시도 ──
+        $altModels = $fallbackModels[$providerKey] ?? [];
+        $altModels = array_filter($altModels, fn($m) => $m !== $originalModel); // 현재 모델 제외
+        if (!empty($altModels)) {
+            $altModel = reset($altModels); // 첫 번째 대체 모델 선택
+            write_log("🔄 {$providerKey} 2차 실패 → 같은 플랫폼 대체 모델({$altModel})로 시도...");
+
+            // 임시로 모델 변경
+            $keys = loadApiKeys();
+            $keys[$providerKey]['model'] = $altModel;
+            saveApiKeys($keys);
+
+            // 새 프로바이더 인스턴스로 호출 (변경된 모델 반영)
+            $altProvider = $providerMap[$providerKey];
+            $altMaxTokens = clampMaxTokens($altModel, $maxTokens);
+            $result = $this->tryCallAndParse($altProvider, $providerKey, $prompts, $altMaxTokens);
+
+            // 원래 모델로 복원
+            $keys = loadApiKeys();
+            $keys[$providerKey]['model'] = $originalModel;
+            saveApiKeys($keys);
+
+            if ($result) {
+                write_log("✅ 대체 모델({$altModel})로 성공!");
+                return $result;
             }
         }
 
-        write_log("{$providerKey} 실패 → 로테이션 폴백");
-        return $this->generateBlogPost($keyword, $naver_data, $internal_links);
+        write_log("❌ {$providerKey} 최종 실패 (같은 플랫폼 내 재시도 모두 실패) → 글 생성 중단");
+        return null;
+    }
+
+    /**
+     * API 호출 + JSON 파싱 + 비용 기록을 한 번에 처리하는 헬퍼
+     */
+    private function tryCallAndParse($provider, $providerKey, $prompts, $maxTokens) {
+        $response = $provider->callAPI($prompts['system'], $prompts['user'], $maxTokens);
+        if (!$response) {
+            write_log("{$provider->getName()} API 응답 없음");
+            return null;
+        }
+
+        $data = $this->parseJSON($response);
+        if (!$data) {
+            write_log("{$provider->getName()} JSON 파싱 실패");
+            return null;
+        }
+
+        $data['content_html'] = $this->mdToHtml($data['content']);
+        $data['_provider'] = $providerKey;
+        write_log("{$provider->getName()} 글 생성 완료: {$data['title']}");
+        incrementAiDailyCount($providerKey);
+
+        $usage = $provider->getLastUsage();
+        if ($usage['input'] > 0 || $usage['output'] > 0) {
+            $cost = trackAiCost($providerKey, $usage['input'], $usage['output']);
+            write_log(sprintf("토큰: in=%d out=%d | 비용: $%.4f", $usage['input'], $usage['output'], $cost));
+        }
+        return $data;
     }
 
     public function testAll() {

@@ -6,6 +6,69 @@
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/prompt.php';
 
+/**
+ * ★ v6: 모델별 max_output_tokens 상한
+ * 요청한 maxTokens가 모델 상한을 초과하면 자동으로 잘라줌
+ */
+function getModelMaxTokens(string $model): int {
+    // ── Claude ──
+    $map = [
+        'claude-haiku-4-5-20251001' => 8192,
+        'claude-sonnet-4-5-20250929' => 8192,
+        'claude-opus-4-6' => 8192,
+        // ── Grok ──
+        'grok-3-mini-fast' => 16384,
+        'grok-3-mini' => 16384,
+        'grok-3' => 16384,
+        'grok-4-1-fast' => 16384,
+        'grok-4-fast' => 16384,
+        'grok-4' => 16384,
+        // ── ChatGPT ──
+        'gpt-4o-mini' => 16384,
+        'gpt-4o' => 16384,
+        'gpt-4.1-nano' => 16384,
+        'gpt-4.1-mini' => 16384,
+        'gpt-4.1' => 32768,
+        'o4-mini' => 16384,
+        'gpt-5-nano' => 16384,
+        'gpt-5-mini' => 16384,
+        'gpt-5.1-codex-mini' => 16384,
+        'gpt-5.4-mini' => 16384,
+        // ── Gemini ──
+        'gemini-2.5-flash-lite' => 65536,
+        'gemini-2.5-flash' => 65536,
+        'gemini-2.5-pro' => 65536,
+    ];
+
+    // 정확한 매칭
+    if (isset($map[$model])) return $map[$model];
+
+    // 부분 매칭 (새 모델 대응)
+    foreach ($map as $key => $limit) {
+        if (str_contains($model, $key)) return $limit;
+    }
+
+    // 프로바이더별 안전한 기본값
+    if (str_contains($model, 'claude')) return 8192;
+    if (str_contains($model, 'grok')) return 16384;
+    if (str_contains($model, 'gpt') || str_contains($model, 'o4')) return 16384;
+    if (str_contains($model, 'gemini')) return 65536;
+
+    return 8192; // 최종 기본값
+}
+
+/**
+ * 요청할 maxTokens를 모델 상한에 맞춰 자동 조정
+ */
+function clampMaxTokens(string $model, int $requested): int {
+    $limit = getModelMaxTokens($model);
+    if ($requested > $limit) {
+        write_log("ℹ️ maxTokens {$requested} → {$limit} (모델 상한: {$model})");
+        return $limit;
+    }
+    return $requested;
+}
+
 
 interface AIProvider {
     public function getName(): string;
@@ -25,6 +88,8 @@ class ClaudeProvider implements AIProvider {
 
     public function callAPI($system, $user, $maxTokens = 8192): ?string {
         $this->lastUsage = ['input'=>0, 'output'=>0];
+        $model = getKey('claude.model', 'claude-haiku-4-5-20251001');
+        $maxTokens = clampMaxTokens($model, $maxTokens);
         $ch = curl_init('https://api.anthropic.com/v1/messages');
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_TIMEOUT => 120,
@@ -34,7 +99,7 @@ class ClaudeProvider implements AIProvider {
                 'anthropic-version: 2023-06-01'
             ],
             CURLOPT_POSTFIELDS => json_encode([
-                'model' => getKey('claude.model', 'claude-haiku-4-5-20251001'),
+                'model' => $model,
                 'max_tokens' => $maxTokens,
                 'system' => $system,
                 'messages' => [['role' => 'user', 'content' => $user]]
@@ -58,6 +123,8 @@ class GrokProvider implements AIProvider {
 
     public function callAPI($system, $user, $maxTokens = 8192): ?string {
         $this->lastUsage = ['input'=>0, 'output'=>0];
+        $model = getKey('grok.model', 'grok-3');
+        $maxTokens = clampMaxTokens($model, $maxTokens);
         $ch = curl_init('https://api.x.ai/v1/chat/completions');
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_TIMEOUT => 120,
@@ -66,7 +133,7 @@ class GrokProvider implements AIProvider {
                 'Authorization: Bearer ' . getKey('grok.api_key'),
             ],
             CURLOPT_POSTFIELDS => json_encode([
-                'model' => getKey('grok.model', 'grok-3'),
+                'model' => $model,
                 'max_tokens' => $maxTokens,
                 'messages' => [
                     ['role' => 'system', 'content' => $system],
@@ -92,6 +159,8 @@ class ChatGPTProvider implements AIProvider {
 
     public function callAPI($system, $user, $maxTokens = 8192): ?string {
         $this->lastUsage = ['input'=>0, 'output'=>0];
+        $model = getKey('chatgpt.model', 'gpt-4o');
+        $maxTokens = clampMaxTokens($model, $maxTokens);
         $ch = curl_init('https://api.openai.com/v1/chat/completions');
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_TIMEOUT => 120,
@@ -100,7 +169,7 @@ class ChatGPTProvider implements AIProvider {
                 'Authorization: Bearer ' . getKey('chatgpt.api_key'),
             ],
             CURLOPT_POSTFIELDS => json_encode([
-                'model' => getKey('chatgpt.model', 'gpt-4o'),
+                'model' => $model,
                 'max_tokens' => $maxTokens,
                 'messages' => [
                     ['role' => 'system', 'content' => $system],
@@ -128,6 +197,7 @@ class GeminiProvider implements AIProvider {
         $this->lastUsage = ['input'=>0, 'output'=>0];
         $model = getKey('gemini.model', 'gemini-2.5-flash');
         $apiKey = getKey('gemini.api_key');
+        $maxTokens = clampMaxTokens($model, $maxTokens);
         $isPro = (strpos($model, 'pro') !== false);
         write_log("Gemini 모델: {$model}" . ($isPro ? " (Pro 모드)" : ""));
 
@@ -467,6 +537,22 @@ class AIRouter {
         if (!$data) { $data = json_decode(preg_replace('/[\x00-\x1F\x7F]/u', ' ', $json), true); }
         if (!$data || empty($data['title']) || empty($data['content'])) return null;
 
+        // ★ v5: AI 말투 후처리 — 잔존하는 AI 표현 자동 치환
+        $data['content'] = $this->removeAiExpressions($data['content']);
+
+        // ★ v5: 제목 상투적 패턴 검증 및 로그
+        $badTitlePatterns = [
+            '/인 줄 알았/', '/의 모든 것/', '/충격적인/', '/당신이 몰랐던/',
+            '/완벽 정리/', '/완벽 가이드/', '/소름 돋는/', '/파헤치다/',
+            '/의 비밀/', '/놀라운 사실/', '/7가지 진실/',
+        ];
+        foreach ($badTitlePatterns as $pat) {
+            if (preg_match($pat, $data['title'])) {
+                write_log("⚠️ 상투적 제목 패턴 감지: {$data['title']}");
+                break;
+            }
+        }
+
         // ★ v4: slug 영문 강제 변환 — 한글이 포함되면 제목 기반으로 영문 slug 생성
         if (!empty($data['slug'])) {
             // 한글/비ASCII 문자가 포함되어 있으면 영문으로 변환
@@ -492,6 +578,63 @@ class AIRouter {
     }
 
     /**
+     * ★ v6: AI 표현 자동 제거/치환 (대폭 확대)
+     * 프롬프트로 막아도 남는 AI 표현들을 후처리로 제거
+     */
+    private function removeAiExpressions($content) {
+        $replacements = [
+            // 시작/전환 상투어
+            '/살펴보겠습니다/' => '정리해봤습니다',
+            '/알아보겠습니다/' => '정리해봤습니다',
+            '/알아볼까요/' => '한번 볼까요',
+            '/살펴볼까요/' => '한번 볼까요',
+            '/확인해볼까요/' => '확인해보죠',
+            '/결론적으로/' => '정리하면',
+            '/종합적으로/' => '다시 보면',
+            '/마무리하자면/' => '정리하면',
+            '/요약하자면/' => '간단히 말하면',
+            '/함께 알아보겠습니다/' => '같이 정리해보죠',
+            '/자세히 다뤄보겠습니다/' => '좀 더 깊이 들어가보면',
+            '/에 대해 알아보겠습니다/' => '에 대해 정리해봤습니다',
+            // 번역체/형용사 남발
+            '/다양한\s/' => '여러 ',
+            '/효과적인\s/' => '괜찮은 ',
+            '/체계적인\s/' => '정리된 ',
+            '/종합적인\s/' => '전체적인 ',
+            '/필수적입니다/' => '꼭 필요합니다',
+            '/핵심입니다/' => '포인트입니다',
+            // 전환어
+            '/그렇다면\s/' => '그러면 ',
+            '/이처럼\s/' => '이렇게 ',
+            '/이를 통해\s/' => '이걸로 ',
+            '/이에 따라\s/' => '그래서 ',
+            // 마무리 상투어
+            '/마지막으로,?\s/' => '그리고 ',
+            '/끝으로,?\s/' => '참고로 ',
+            // ~라고 할 수 있습니다 패턴
+            '/라고 할 수 있습니다/' => '라고 봅니다',
+            '/라고 볼 수 있습니다/' => '라고 보면 됩니다',
+            // 의 경우/에 있어서 번역체
+            '/의 경우에는/' => '는',
+            '/에 있어서/' => '에서',
+        ];
+
+        $found = [];
+        foreach ($replacements as $pattern => $replacement) {
+            if (preg_match($pattern, $content)) {
+                $found[] = trim($pattern, '/');
+                $content = preg_replace($pattern, $replacement, $content);
+            }
+        }
+
+        if (!empty($found)) {
+            write_log("⚠️ AI 표현 자동 치환: " . implode(', ', $found));
+        }
+
+        return $content;
+    }
+
+    /**
      * 제목/키워드에서 영문 slug 생성
      */
     private function generateEnglishSlug($title, $keyword = '') {
@@ -508,8 +651,15 @@ class AIRouter {
     /**
      * 마크다운 → Gutenberg 블록 HTML 변환
      * 각 요소가 개별 블록으로 인식되어 WP 편집기에서 쉽게 편집 가능
+     * v5: CTA 버튼 블록, H2/H3 텍스트 표기 자동 수정, 테이블 3열 강제
      */
     private function mdToHtml($md) {
+        // ★ v5: 전처리 — AI가 "H2: 제목", "H3: 제목" 텍스트로 출력한 경우 마크다운으로 변환
+        $md = preg_replace('/^H2:\s*(.+)$/m', '## $1', $md);
+        $md = preg_replace('/^H3:\s*(.+)$/m', '### $1', $md);
+        // "**소제목**" 패턴을 ## 으로 변환 (단독 줄에 **텍스트**만 있는 경우)
+        $md = preg_replace('/^\*\*([^*]{4,40})\*\*\s*$/m', '## $1', $md);
+
         $lines = explode("\n", $md);
         $blocks = [];
         $buffer = [];
@@ -571,6 +721,13 @@ class AIRouter {
                 if (empty($cells)) continue;
                 // 구분선 스킵 (---  :---:  등)
                 if (preg_match('/^[\s\-:|]+$/', implode('', $cells))) { $skipNext = true; continue; }
+                
+                // ★ v5: 4열 이상이면 3열로 강제 자르기
+                if (count($cells) > 3) {
+                    write_log("⚠️ 테이블 " . count($cells) . "열 감지 → 3열로 자름");
+                    $cells = array_slice($cells, 0, 3);
+                }
+                
                 $isHead = ($ri === 0 || (!$head && !$skipNext));
                 $tag = $isHead && !$head ? 'th' : 'td';
                 $tr = '<tr>';
@@ -649,6 +806,15 @@ class AIRouter {
             if (preg_match('/^\[IMAGE:/', $t)) {
                 $flush();
                 $blocks[] = $t; // 그대로 유지, processImages에서 블록으로 변환
+                continue;
+            }
+
+            // ★ v5.1: [BUTTON:텍스트|URL] → 순수 HTML 버튼 (WordPress + 자체CMS 모두 호환)
+            if (preg_match('/^\[BUTTON:\s*(.+?)\s*\|\s*(https?:\/\/[^\]]+)\s*\]$/', $t, $bm)) {
+                $flush();
+                $btnText = trim($bm[1]);
+                $btnUrl = trim($bm[2]);
+                $blocks[] = "<div style=\"text-align:center;margin:28px 0\"><a href=\"{$btnUrl}\" target=\"_blank\" rel=\"noopener\" style=\"display:inline-block;padding:14px 32px;background:#4a6cf7;color:#fff;text-decoration:none;border-radius:8px;font-size:15px;font-weight:600;box-shadow:0 2px 8px rgba(74,108,247,.3);transition:background .2s\">{$btnText}</a></div>";
                 continue;
             }
 

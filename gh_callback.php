@@ -1,0 +1,200 @@
+<?php
+/**
+ * ═══════════════════════════════════════════════════════════
+ * GitHub Actions 콜백 엔드포인트 — gh_callback.php
+ * ═══════════════════════════════════════════════════════════
+ * 
+ * GitHub Actions에서 auto_publish.php 실행 중 진행 상황을
+ * 서버로 보내는 콜백을 처리합니다. 토큰 인증 기반 (세션 불필요).
+ * 
+ * 📌 의존: config.php (getKey, loadJobs, updateJob, updateJobPost)
+ * 📌 호출: auto_publish.php의 ghCallback() 함수
+ * 📌 수신 데이터: POST JSON {token, job_id, type, ...}
+ * 
+ * 🔧 콜백 타입:
+ *   post_running   → 글 처리 시작
+ *   post_progress  → 상세 진행 단계 (NEW: [1/7] 검색, [2/7] AI 생성 등)
+ *   post_done      → 글 발행 완료
+ *   post_failed    → 글 실패
+ *   job_done       → 전체 작업 완료
+ *   choco_running  → 초코365 진행 중
+ *   choco_done     → 초코365 개별 완료
+ *   choco_failed   → 초코365 개별 실패
+ *   choco_job_done → 초코365 전체 완료
+ */
+if (($_GET['action'] ?? '') === 'gh_callback' || ($_POST['action'] ?? '') === 'gh_callback_ext') {
+    header('Content-Type: application/json; charset=UTF-8');
+    $input = json_decode(file_get_contents('php://input'), true) ?? $_POST;
+    $cbToken = $input['token'] ?? '';
+    $expectedToken = md5(getKey('github.token') . getKey('admin.email'));
+    if ($cbToken !== $expectedToken) {
+        http_response_code(403);
+        echo json_encode(['error' => 'invalid token']);
+        exit;
+    }
+    
+    $cbJobId = $input['job_id'] ?? '';
+    $cbType = $input['type'] ?? '';
+    
+    // ★ FIX: stopped/done 상태인 Job은 콜백 무시 (강제종료 후 GitHub가 계속 보내는 콜백 차단)
+    if ($cbJobId) {
+        $cbJob = getJob($cbJobId);
+        if ($cbJob && in_array($cbJob['status'] ?? '', ['stopped', 'done'])) {
+            // 단, job_done 콜백은 허용 (최종 완료 처리)
+            if ($cbType !== 'job_done') {
+                echo json_encode(['ok' => true, 'ignored' => true, 'reason' => 'job already ' . $cbJob['status']]);
+                exit;
+            }
+        }
+    }
+    
+    if ($cbJobId && $cbType === 'post_done') {
+        $pi = intval($input['post_idx'] ?? -1);
+        if ($pi >= 0) {
+            updateJobPost($cbJobId, $pi, [
+                'status' => 'done',
+                'post_id' => $input['post_id'] ?? '',
+                'url' => $input['url'] ?? '',
+                'ai_used' => $input['ai_used'] ?? '',
+                'title' => $input['title'] ?? '',
+            ]);
+            $logFile = ROOT_DIR . '/logs/job_' . $cbJobId . '.log';
+            $t = date('H:i:s');
+            $aiInfo = $input['ai_used'] ?? '';
+            $logMsg = "[{$t}] ✅ [{$pi}] 발행 완료: " . ($input['title'] ?? '') . " | AI: {$aiInfo}\n[{$t}] 🔗 " . ($input['url'] ?? '') . "\n\n";
+            file_put_contents($logFile, $logMsg, FILE_APPEND);
+        }
+    } elseif ($cbJobId && $cbType === 'post_failed') {
+        $pi = intval($input['post_idx'] ?? -1);
+        if ($pi >= 0) {
+            updateJobPost($cbJobId, $pi, ['status' => 'failed', 'error' => $input['error'] ?? '실행 실패']);
+            $logFile = ROOT_DIR . '/logs/job_' . $cbJobId . '.log';
+            $t = date('H:i:s');
+            file_put_contents($logFile, "[{$t}] ❌ [{$pi}] 실패: " . ($input['error'] ?? '') . "\n\n", FILE_APPEND);
+        }
+    } elseif ($cbJobId && $cbType === 'post_running') {
+        $pi = intval($input['post_idx'] ?? -1);
+        if ($pi >= 0) {
+            updateJobPost($cbJobId, $pi, ['status' => 'running']);
+            $logFile = ROOT_DIR . '/logs/job_' . $cbJobId . '.log';
+            $t = date('H:i:s');
+            file_put_contents($logFile, "[{$t}] ⏳ [{$pi}] " . ($input['keyword'] ?? '') . " 처리 중...\n", FILE_APPEND);
+        }
+    } elseif ($cbJobId && $cbType === 'post_progress') {
+        // 🆕 상세 진행 단계 로그 (GitHub Actions → 서버 실시간 전달)
+        $logFile = ROOT_DIR . '/logs/job_' . $cbJobId . '.log';
+        $stepMsg = $input['message'] ?? '';
+        if ($stepMsg) {
+            $t = date('H:i:s');
+            file_put_contents($logFile, "[{$t}] {$stepMsg}\n", FILE_APPEND);
+        }
+    } elseif ($cbJobId && ($cbType === 'job_done' || $cbType === 'job_continuing')) {
+        // job_continuing: 타임아웃 임박으로 새 워크플로우로 이어하기
+        if ($cbType === 'job_continuing') {
+            updateJob($cbJobId, ['status' => 'continuing']);
+            $logFile = ROOT_DIR . '/logs/job_' . $cbJobId . '.log';
+            $t = date('H:i:s');
+            $remaining = $input['remaining'] ?? '?';
+            file_put_contents($logFile, "\n[{$t}] 🔄 타임아웃 임박 → 남은 {$remaining}개 자동 이어하기 (성공 " . ($input['ok']??0) . " / 실패 " . ($input['fail']??0) . ")\n\n", FILE_APPEND);
+        } else {
+            updateJob($cbJobId, ['status' => 'done']);
+            $logFile = ROOT_DIR . '/logs/job_' . $cbJobId . '.log';
+            $t = date('H:i:s');
+            file_put_contents($logFile, "\n[{$t}] 🐙 GitHub Actions 작업 완료!\n", FILE_APPEND);
+        }
+        $statusFile = ROOT_DIR . '/logs/job.status';
+        if (file_exists($statusFile)) {
+            $st = json_decode(file_get_contents($statusFile), true) ?: [];
+            $st['status'] = ($cbType === 'job_continuing') ? 'continuing' : 'done';
+            file_put_contents($statusFile, json_encode($st));
+        }
+    } elseif ($cbJobId && $cbType === 'continue_job') {
+        // ★ 자동 이어하기: 서버에서 GitHub Actions 새 워크플로우 트리거
+        $job = getJob($cbJobId);
+        if ($job) {
+            $ghToken = getKey('github.token');
+            $ghRepo = getKey('github.repo');
+            if ($ghToken && $ghRepo) {
+                $jobDataB64 = base64_encode(json_encode($job, JSON_UNESCAPED_UNICODE));
+                $cbUrl = getKey('github.callback_url', '');
+                $cbTk = md5($ghToken . getKey('admin.email'));
+                
+                $dispatchPayload = json_encode([
+                    'event_type' => 'continue-job',
+                    'client_payload' => [
+                        'job_id' => $cbJobId,
+                        'job_data' => $jobDataB64,
+                        'callback_url' => $cbUrl,
+                        'callback_token' => $cbTk,
+                    ],
+                ]);
+                
+                $ch = curl_init("https://api.github.com/repos/{$ghRepo}/dispatches");
+                curl_setopt_array($ch, [
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_POST => true,
+                    CURLOPT_TIMEOUT => 15,
+                    CURLOPT_HTTPHEADER => [
+                        'Content-Type: application/json',
+                        'Accept: application/vnd.github+json',
+                        "Authorization: Bearer {$ghToken}",
+                        'User-Agent: auto-publish-bot',
+                    ],
+                    CURLOPT_POSTFIELDS => $dispatchPayload,
+                ]);
+                $ghResp = curl_exec($ch);
+                $ghCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                curl_close($ch);
+                
+                $logFile = ROOT_DIR . '/logs/job_' . $cbJobId . '.log';
+                $t = date('H:i:s');
+                if ($ghCode === 204 || $ghCode === 200) {
+                    file_put_contents($logFile, "[{$t}] 🔄 자동 이어하기 워크플로우 트리거 성공\n", FILE_APPEND);
+                } else {
+                    file_put_contents($logFile, "[{$t}] ⚠️ 자동 이어하기 트리거 실패 (HTTP {$ghCode})\n", FILE_APPEND);
+                }
+            }
+        }
+    } elseif ($cbJobId && $cbType === 'choco_running') {
+        $pi = intval($input['post_idx'] ?? -1);
+        // 초코365 진행 상태를 로그 파일에 기록
+        $logFile = ROOT_DIR . '/logs/choco_' . $cbJobId . '.json';
+        $chocoLog = file_exists($logFile) ? json_decode(file_get_contents($logFile), true) : ['items'=>[],'status'=>'running'];
+        if ($pi >= 0) {
+            $chocoLog['items'][$pi] = ['status'=>'running','keyword'=>$input['keyword']??'','time'=>date('H:i:s')];
+        }
+        file_put_contents($logFile, json_encode($chocoLog, JSON_UNESCAPED_UNICODE));
+    } elseif ($cbJobId && $cbType === 'choco_done') {
+        $pi = intval($input['post_idx'] ?? -1);
+        $logFile = ROOT_DIR . '/logs/choco_' . $cbJobId . '.json';
+        $chocoLog = file_exists($logFile) ? json_decode(file_get_contents($logFile), true) : ['items'=>[],'status'=>'running'];
+        if ($pi >= 0) {
+            $chocoLog['items'][$pi] = [
+                'status'=>'done', 'title'=>$input['title']??'', 'slug'=>$input['slug']??'',
+                'emoji'=>$input['emoji']??'', 'ai'=>$input['ai']??'', 'ai_sec'=>$input['ai_sec']??0,
+                'theme'=>$input['theme']??'', 'tone'=>$input['tone']??'',
+                'format'=>$input['format']??'', 'chars'=>$input['chars']??0, 'time'=>date('H:i:s'),
+            ];
+        }
+        file_put_contents($logFile, json_encode($chocoLog, JSON_UNESCAPED_UNICODE));
+    } elseif ($cbJobId && $cbType === 'choco_failed') {
+        $pi = intval($input['post_idx'] ?? -1);
+        $logFile = ROOT_DIR . '/logs/choco_' . $cbJobId . '.json';
+        $chocoLog = file_exists($logFile) ? json_decode(file_get_contents($logFile), true) : ['items'=>[],'status'=>'running'];
+        if ($pi >= 0) {
+            $chocoLog['items'][$pi] = ['status'=>'failed','keyword'=>$input['keyword']??'','error'=>$input['error']??'','time'=>date('H:i:s')];
+        }
+        file_put_contents($logFile, json_encode($chocoLog, JSON_UNESCAPED_UNICODE));
+    } elseif ($cbJobId && $cbType === 'choco_job_done') {
+        $logFile = ROOT_DIR . '/logs/choco_' . $cbJobId . '.json';
+        $chocoLog = file_exists($logFile) ? json_decode(file_get_contents($logFile), true) : ['items'=>[]];
+        $chocoLog['status'] = 'done';
+        $chocoLog['ok'] = $input['ok'] ?? 0;
+        $chocoLog['fail'] = $input['fail'] ?? 0;
+        $chocoLog['finished_at'] = date('Y-m-d H:i:s');
+        file_put_contents($logFile, json_encode($chocoLog, JSON_UNESCAPED_UNICODE));
+    }
+    
+    echo json_encode(['ok' => true]);
+    exit;
+}

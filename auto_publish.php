@@ -24,6 +24,106 @@ require_once __DIR__ . '/classes.php';
 $logsDir = __DIR__ . '/logs';
 if (!is_dir($logsDir)) { mkdir($logsDir, 0755, true); }
 
+// ── 타임아웃 자동 이어하기 ──
+// GitHub Actions 최대 240분 중 210분(3시간30분)이 지나면 남은 작업을 새 워크플로우로 넘김
+$GLOBALS['_startTime'] = time();
+define('GA_TIME_LIMIT_SEC', 210 * 60); // 3시간 30분
+
+/**
+ * GitHub Actions 타임아웃 임박 여부 체크
+ */
+function isTimeRunningOut(): bool {
+    if (!getenv('GITHUB_ACTIONS')) return false; // 서버 직접 실행 시에는 무제한
+    return (time() - $GLOBALS['_startTime']) >= GA_TIME_LIMIT_SEC;
+}
+
+/**
+ * 남은 pending 글들을 새 GitHub Actions 워크플로우로 자동 재시작
+ * GitHub API를 직접 호출하여 repository_dispatch 이벤트 전송
+ */
+function triggerContinuation(string $jobId): bool {
+    $cbUrl = getenv('CALLBACK_URL');
+    $cbToken = getenv('CALLBACK_TOKEN');
+
+    // 방법 1: 서버 콜백을 통한 재시작
+    if ($cbUrl && $cbToken) {
+        $payload = [
+            'type' => 'continue_job',
+            'token' => $cbToken,
+            'job_id' => $jobId,
+        ];
+        $ch = curl_init($cbUrl . '?action=gh_callback');
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_TIMEOUT => 15,
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+            CURLOPT_POSTFIELDS => json_encode($payload),
+        ]);
+        $resp = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($code === 200) {
+            write_log("🔄 자동 이어하기 요청 성공 (서버 콜백) → 새 워크플로우가 나머지를 처리합니다");
+            return true;
+        }
+        write_log("⚠️ 서버 콜백 실패 (HTTP {$code}) → GitHub API 직접 시도");
+    }
+
+    // 방법 2: GitHub API 직접 호출
+    $ghToken = getenv('GITHUB_TOKEN');
+    $ghRepo = getenv('GITHUB_REPOSITORY');
+    if (!$ghToken || !$ghRepo) {
+        write_log("⚠️ GITHUB_TOKEN 또는 GITHUB_REPOSITORY 없음 → 자동 이어하기 불가");
+        return false;
+    }
+
+    // 현재 Job 데이터를 다시 읽어서 base64 인코딩
+    $job = getJob($jobId);
+    if (!$job) {
+        write_log("⚠️ Job 데이터 없음 → 자동 이어하기 불가");
+        return false;
+    }
+    $jobDataB64 = base64_encode(json_encode($job, JSON_UNESCAPED_UNICODE));
+
+    $dispatchPayload = [
+        'event_type' => 'continue-job',
+        'client_payload' => [
+            'job_id' => $jobId,
+            'job_data' => $jobDataB64,
+            'callback_url' => $cbUrl ?: '',
+            'callback_token' => $cbToken ?: '',
+        ],
+    ];
+
+    $ch = curl_init("https://api.github.com/repos/{$ghRepo}/dispatches");
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
+        CURLOPT_TIMEOUT => 15,
+        CURLOPT_HTTPHEADER => [
+            'Content-Type: application/json',
+            'Accept: application/vnd.github+json',
+            "Authorization: Bearer {$ghToken}",
+            'User-Agent: auto-publish-bot',
+        ],
+        CURLOPT_POSTFIELDS => json_encode($dispatchPayload),
+    ]);
+    $resp = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    // GitHub dispatch는 성공 시 204 반환
+    if ($code === 204 || $code === 200) {
+        write_log("🔄 자동 이어하기 요청 성공 (GitHub API) → 새 워크플로우가 나머지를 처리합니다");
+        return true;
+    } else {
+        write_log("⚠️ GitHub API 실패 (HTTP {$code}): {$resp}");
+        return false;
+    }
+}
+
 // ── GitHub Actions 콜백 함수 ──
 function ghCallback($type, $data = []) {
     $cbUrl = getenv('CALLBACK_URL');
@@ -167,6 +267,28 @@ if (isset($opts['job'])) {
     $ok = 0; $fail = 0;
 
     foreach ($pendingPosts as $idx => $postIdx) {
+        // ★ 타임아웃 체크: 3시간 30분 지나면 남은 글을 새 워크플로우로 넘김
+        if (isTimeRunningOut()) {
+            $remaining = count($pendingPosts) - $idx;
+            $elapsed = round((time() - $GLOBALS['_startTime']) / 60);
+            write_log("⏰ GitHub Actions 타임아웃 임박 ({$elapsed}분 경과) → 남은 {$remaining}개 글 자동 이어하기");
+            ghProgress($jobId, "⏰ 타임아웃 임박 → 남은 {$remaining}개 자동 이어하기 시작");
+
+            // 현재 상태 저장 (pending인 것들은 그대로 유지됨)
+            updateJob($jobId, ['status' => 'continuing']);
+
+            // 새 워크플로우 트리거
+            if (triggerContinuation($jobId)) {
+                write_log("══════ 이번 실행 중간 결과: 성공 {$ok} / 실패 {$fail} | 남은 {$remaining}개는 다음 실행에서 계속 ══════");
+                ghCallback('job_continuing', ['job_id' => $jobId, 'ok' => $ok, 'fail' => $fail, 'remaining' => $remaining]);
+            } else {
+                // 자동 이어하기 실패 시 draft로 변경 (수동으로 다시 실행 가능)
+                updateJob($jobId, ['status' => 'draft']);
+                write_log("⚠️ 자동 이어하기 실패 → 남은 {$remaining}개는 수동으로 재실행하세요");
+            }
+            exit(0);
+        }
+
         $pp = $job['posts'][$postIdx];
         $kw = $pp['keyword'];
         $customTitle = $pp['title'];
@@ -254,36 +376,15 @@ if (isset($opts['job'])) {
             $post['focus_keyphrase'] = $kw;
 
             $len = mb_strlen(strip_tags($post['content_html']));
-            write_log("본문: {$len}자 | AI: {$post['_provider']} | 제목: {$post['title']}");
-            ghProgress($jobId, "📝 AI 생성 완료: {$len}자 | {$post['_provider']} | {$post['title']}");
+            $_aiModel = getKey($post['_provider'] . '.model', '');
+            $_imgModel = getKey('gemini.image_model', '');
+            write_log("본문: {$len}자 | AI: {$post['_provider']}({$_aiModel}) | 이미지: {$_imgModel} | 제목: {$post['title']}");
+            ghProgress($jobId, "📝 AI 생성 완료: {$len}자 | {$post['_provider']}({$_aiModel}) | {$post['title']}");
 
-            // 본문 짧으면 자동 재생성 (최소 글자수의 70% 미만일 때)
-            $minThreshold = (int)($contentMin * 0.7);
-            if ($len < $minThreshold && $len >= 500) {
-                write_log("⚠️ 본문 짧음 ({$len}자 < 최소 {$contentMin}자의 70%) → 재생성 시도");
-                $retryPost = null;
-                if ($postAiMode === 'random') {
-                    $retryPost = $ai->generateBlogPost($kw, $ndata, $internalLinks, true, $contentMin, $contentMax, $postImgCnt);
-                } elseif (in_array($postAiMode, ['claude','gemini','chatgpt','grok'])) {
-                    $retryPost = $ai->generateWithProvider($kw, $postAiMode, $ndata, $internalLinks, $contentMin, $contentMax, $postImgCnt);
-                } else {
-                    $retryPost = $ai->generateBlogPost($kw, $ndata, $internalLinks, false, $contentMin, $contentMax, $postImgCnt);
-                }
-                if ($retryPost) {
-                    $retryLen = mb_strlen(strip_tags($retryPost['content_html']));
-                    if ($retryLen > $len) {
-                        write_log("재생성 성공: {$retryLen}자 (이전: {$len}자)");
-                        $post = $retryPost; $len = $retryLen;
-                        if ($customTitle && $customTitle !== $kw) $post['title'] = $customTitle;
-                        $post['focus_keyphrase'] = $kw;
-                    } else {
-                        write_log("재생성 결과도 짧음 ({$retryLen}자) → 원본 사용");
-                    }
-                }
-            }
-
+            // ★ v6: 재생성 없음 — AI가 만든 그대로 발행 (시간·토큰 절약)
+            // 500자 미만만 실패 처리, 나머지는 짧아도 발행
             if ($len < $contentMin) {
-                write_log("⚠️ 본문 짧음: {$len}자 (설정 최소: {$contentMin}자) → 발행은 진행");
+                write_log("ℹ️ 본문 짧음: {$len}자 (설정 최소: {$contentMin}자) → 그대로 발행");
             }
 
             if ($len < 500) {
@@ -338,7 +439,8 @@ if (isset($opts['job'])) {
 
             write_log("[3/7] 썸네일");
             ghProgress($jobId, "[3/7] 썸네일 생성 중...");
-            $thumb = $image->createThumbnail($post['title'], $thumbSearch);
+            $thumbPrompt = $post['thumbnail_prompt'] ?? '';
+            $thumb = $image->createThumbnail($post['title'], $thumbSearch, $thumbPrompt);
 
             // 4. 본문 이미지 (이미지 개수 제한)
             write_log("[4/7] 본문이미지 (설정: {$postImgCnt}개)");
@@ -422,13 +524,19 @@ if (isset($opts['job'])) {
             ]);
 
             if ($result) {
-                // 7. 검색엔진 핑
+                // ★ FIX: 중복 감지된 글은 핑 스킵
+                $isDuplicate = !empty($result['_duplicate']);
+                
+                // 7. 검색엔진 핑 (중복이 아닌 경우만)
                 $postLink = $result['link'] ?? '';
                 $pingResults = [];
-                if ($postLink) {
+                if ($postLink && !$isDuplicate) {
                     write_log("[7/7] 검색엔진 핑");
                     ghProgress($jobId, "[7/7] 검색엔진 핑 전송 중...");
                     $pingResults = SearchEnginePing::pingAll($postLink, $site['site_url']);
+                } elseif ($isDuplicate) {
+                    write_log("[7/7] 중복 글 → 핑 스킵");
+                    ghProgress($jobId, "[7/7] 중복 감지 → 핑 스킵");
                 }
 
                 $postId = $result['id'] ?? '';
@@ -437,18 +545,19 @@ if (isset($opts['job'])) {
                 ghProgress($jobId, "✅ 발행 완료: {$post['title']}");
                 write_log("🔗 {$postUrl}");
 
+                $aiUsedDetail = ($post['_provider'] ?? '') . '(' . ($_aiModel ?: '?') . ')';
                 updateJobPost($jobId, $postIdx, [
                     'status' => 'done',
                     'post_id' => $postId,
                     'url' => $postUrl,
-                    'ai_used' => $post['_provider'] ?? '',
+                    'ai_used' => $aiUsedDetail,
                     'ping_results' => $pingResults,
                     'ping_at' => date('Y-m-d H:i:s'),
                 ]);
                 ghCallback('post_done', [
                     'job_id' => $jobId, 'post_idx' => $postIdx,
                     'post_id' => $postId, 'url' => $postUrl,
-                    'title' => $post['title'] ?? '', 'ai_used' => $post['_provider'] ?? '',
+                    'title' => $post['title'] ?? '', 'ai_used' => $aiUsedDetail,
                 ]);
                 $ok++;
             } else {
@@ -475,6 +584,10 @@ if (isset($opts['job'])) {
     $finalJob = getJob($jobId);
     $allDone = empty(array_filter($finalJob['posts'] ?? [], fn($p) => $p['status'] === 'pending'));
     updateJob($jobId, ['status' => $allDone ? 'done' : 'draft']);
+
+    // ★ FIX: 재발행 락 파일 정리
+    $retryLockFile = __DIR__ . '/logs/retry_' . $jobId . '.lock';
+    if (file_exists($retryLockFile)) @unlink($retryLockFile);
 
     write_log("══════ 작업 완료: 성공 {$ok} / 실패 {$fail} ══════");
     ghProgress($jobId, "══════ 작업 완료: 성공 {$ok} / 실패 {$fail} ══════");
@@ -584,7 +697,7 @@ foreach ($sites as $siteIdx => $site) {
             $len = mb_strlen(strip_tags($post['content_html']));
             $slug = $post['slug'] ?? '';
             $focusKw = $post['focus_keyphrase'] ?? $kw;
-            write_log("본문: {$len}자 | AI: {$post['_provider']} | 태그: " . count($post['tags'] ?? []) . "개 | slug: {$slug}");
+            write_log("본문: {$len}자 | AI: {$post['_provider']}(" . getKey($post['_provider'].'.model','') . ") | 이미지: " . getKey('gemini.image_model','') . " | slug: {$slug}");
             if ($len < MIN_CONTENT_LENGTH) { write_log("⚠️ 짧음({$len}자 < " . MIN_CONTENT_LENGTH . "자) → 스킵"); $fail++; continue; }
 
             // AI가 제공한 이미지 검색어 사용 (관련성 높은 이미지!)
@@ -618,7 +731,8 @@ foreach ($sites as $siteIdx => $site) {
                 $tmpKeys['image_source']['priority'] = $ordered;
                 saveApiKeys($tmpKeys);
             }
-            $thumb = $image->createThumbnail($post['title'], $thumbSearch);
+            $thumbPrompt = $post['thumbnail_prompt'] ?? '';
+            $thumb = $image->createThumbnail($post['title'], $thumbSearch, $thumbPrompt);
             write_log("[4/7] 본문이미지");
             ghProgress($jobId, "[4/7] 본문 이미지 삽입 중...");
             $proc = $image->processImages($post['content_html'], $imgSearches);

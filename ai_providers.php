@@ -83,7 +83,10 @@ class ClaudeProvider implements AIProvider {
     private $lastUsage = ['input'=>0, 'output'=>0];
     public function getName(): string { return 'Claude'; }
     public function getKey(): string { return 'claude'; }
-    public function isConfigured(): bool { return !empty(getKey('claude.api_key')) && !empty(getKey('claude.model')); }
+    public function isConfigured(): bool {
+        $model = getKey('claude.model');
+        return !empty(getKey('claude.api_key')) && !empty($model) && $model !== '사용 안 함' && $model !== 'none';
+    }
     public function getLastUsage(): array { return $this->lastUsage; }
 
     public function callAPI($system, $user, $maxTokens = 8192): ?string {
@@ -118,7 +121,10 @@ class GrokProvider implements AIProvider {
     private $lastUsage = ['input'=>0, 'output'=>0];
     public function getName(): string { return 'Grok'; }
     public function getKey(): string { return 'grok'; }
-    public function isConfigured(): bool { return !empty(getKey('grok.api_key')) && !empty(getKey('grok.model')); }
+    public function isConfigured(): bool {
+        $model = getKey('grok.model');
+        return !empty(getKey('grok.api_key')) && !empty($model) && $model !== '사용 안 함' && $model !== 'none';
+    }
     public function getLastUsage(): array { return $this->lastUsage; }
 
     public function callAPI($system, $user, $maxTokens = 8192): ?string {
@@ -154,7 +160,10 @@ class ChatGPTProvider implements AIProvider {
     private $lastUsage = ['input'=>0, 'output'=>0];
     public function getName(): string { return 'ChatGPT'; }
     public function getKey(): string { return 'chatgpt'; }
-    public function isConfigured(): bool { return !empty(getKey('chatgpt.api_key')) && !empty(getKey('chatgpt.model')); }
+    public function isConfigured(): bool {
+        $model = getKey('chatgpt.model');
+        return !empty(getKey('chatgpt.api_key')) && !empty($model) && $model !== '사용 안 함' && $model !== 'none';
+    }
     public function getLastUsage(): array { return $this->lastUsage; }
 
     public function callAPI($system, $user, $maxTokens = 8192): ?string {
@@ -190,7 +199,10 @@ class GeminiProvider implements AIProvider {
     private $lastUsage = ['input'=>0, 'output'=>0];
     public function getName(): string { return 'Gemini'; }
     public function getKey(): string { return 'gemini'; }
-    public function isConfigured(): bool { return !empty(getKey('gemini.api_key')) && !empty(getKey('gemini.model')); }
+    public function isConfigured(): bool {
+        $model = getKey('gemini.model');
+        return !empty(getKey('gemini.api_key')) && !empty($model) && $model !== '사용 안 함' && $model !== 'none';
+    }
     public function getLastUsage(): array { return $this->lastUsage; }
 
     public function callAPI($system, $user, $maxTokens = 8192): ?string {

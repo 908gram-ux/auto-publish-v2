@@ -11,7 +11,7 @@ on:
         required: false
         default: 'gemini'
   repository_dispatch:
-    types: [publish-job, choco-job]
+    types: [publish-job, choco-job, continue-job]
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -97,13 +97,18 @@ jobs:
               exit $?
             fi
 
-            # 블로그 발행 Job
+            # 블로그 발행 Job (신규 또는 이어하기 모두 동일하게 처리)
             JOB_ID="${{ github.event.client_payload.job_id }}"
-            [ -n "$JOB_ID" ] && php auto_publish.php --job=$JOB_ID && exit $?
+            if [ -n "$JOB_ID" ]; then
+              echo "📋 Job 실행: $JOB_ID (pending 글만 처리)"
+              php auto_publish.php --job=$JOB_ID
+              exit $?
+            fi
           fi
           php auto_publish.php $SITE_OPT $AI_OPT
         env:
           TZ: Asia/Seoul
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: 변경사항 커밋
         if: github.event.client_payload.event_type != 'choco-job'
         run: |
@@ -116,6 +121,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: publish-log-${{ github.run_number }}
+          name: publish-log-${{ github.run_number }}-${{ github.run_attempt }}
           path: publish_log.txt
           retention-days: 7

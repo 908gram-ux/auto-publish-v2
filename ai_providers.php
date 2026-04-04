@@ -84,8 +84,11 @@ class ClaudeProvider implements AIProvider {
     public function getName(): string { return 'Claude'; }
     public function getKey(): string { return 'claude'; }
     public function isConfigured(): bool {
-        $model = getKey('claude.model');
-        return !empty(getKey('claude.api_key')) && !empty($model) && $model !== '사용 안 함' && $model !== 'none';
+        $model = trim(getKey('claude.model'));
+        if (empty($model)) return false;
+        $disabled = ['사용 안 함', '사용안함', 'none', 'disabled', '미사용'];
+        if (in_array($model, $disabled, true)) return false;
+        return !empty(getKey('claude.api_key'));
     }
     public function getLastUsage(): array { return $this->lastUsage; }
 
@@ -122,8 +125,11 @@ class GrokProvider implements AIProvider {
     public function getName(): string { return 'Grok'; }
     public function getKey(): string { return 'grok'; }
     public function isConfigured(): bool {
-        $model = getKey('grok.model');
-        return !empty(getKey('grok.api_key')) && !empty($model) && $model !== '사용 안 함' && $model !== 'none';
+        $model = trim(getKey('grok.model'));
+        if (empty($model)) return false;
+        $disabled = ['사용 안 함', '사용안함', 'none', 'disabled', '미사용'];
+        if (in_array($model, $disabled, true)) return false;
+        return !empty(getKey('grok.api_key'));
     }
     public function getLastUsage(): array { return $this->lastUsage; }
 
@@ -161,8 +167,11 @@ class ChatGPTProvider implements AIProvider {
     public function getName(): string { return 'ChatGPT'; }
     public function getKey(): string { return 'chatgpt'; }
     public function isConfigured(): bool {
-        $model = getKey('chatgpt.model');
-        return !empty(getKey('chatgpt.api_key')) && !empty($model) && $model !== '사용 안 함' && $model !== 'none';
+        $model = trim(getKey('chatgpt.model'));
+        if (empty($model)) return false;
+        $disabled = ['사용 안 함', '사용안함', 'none', 'disabled', '미사용'];
+        if (in_array($model, $disabled, true)) return false;
+        return !empty(getKey('chatgpt.api_key'));
     }
     public function getLastUsage(): array { return $this->lastUsage; }
 
@@ -200,8 +209,11 @@ class GeminiProvider implements AIProvider {
     public function getName(): string { return 'Gemini'; }
     public function getKey(): string { return 'gemini'; }
     public function isConfigured(): bool {
-        $model = getKey('gemini.model');
-        return !empty(getKey('gemini.api_key')) && !empty($model) && $model !== '사용 안 함' && $model !== 'none';
+        $model = trim(getKey('gemini.model'));
+        if (empty($model)) return false;
+        $disabled = ['사용 안 함', '사용안함', 'none', 'disabled', '미사용'];
+        if (in_array($model, $disabled, true)) return false;
+        return !empty(getKey('gemini.api_key'));
     }
     public function getLastUsage(): array { return $this->lastUsage; }
 
@@ -458,10 +470,10 @@ class AIRouter {
 
     /**
      * 특정 AI 프로바이더로 직접 생성
-     * ★ v7: 실패 시 같은 플랫폼 내에서만 1회 재시도 (다른 플랫폼으로 절대 넘어가지 않음)
-     *   1차: 같은 모델로 재시도 (타임아웃/일시 장애 대응)
-     *   2차: 같은 플랫폼의 대체 모델로 시도 (모델 고장 대응)
-     *   그래도 실패 → 글 생성 중단 (다른 AI 플랫폼으로 폴백 안 함)
+     * ★ v7: 설정값 엄격 준수
+     *   - isConfigured() false면 호출 안 함 (다른 AI로 폴백 안 함)
+     *   - 실패 시 같은 모델로 10초 후 1회만 재시도
+     *   - 다른 플랫폼, 다른 모델로 절대 바꾸지 않음
      */
     public function generateWithProvider($keyword, $providerKey, $naver_data = [], $internal_links = [], $contentMin = 3000, $contentMax = 5000, $imageCount = 2) {
         $providerMap = ['claude'=>new ClaudeProvider(),'grok'=>new GrokProvider(),'chatgpt'=>new ChatGPTProvider(),'gemini'=>new GeminiProvider()];
@@ -469,7 +481,6 @@ class AIRouter {
 
         if (!$provider || !$provider->isConfigured()) {
             write_log("⚠️ {$providerKey} 사용 불가 (미설정 또는 '사용 안 함') → 글 생성 중단");
-            write_log("💡 설정 확인: api_keys.json에서 {$providerKey}.model 값을 확인하세요");
             return null;
         }
         if (!checkAiDailyLimit($providerKey)) {
@@ -479,61 +490,25 @@ class AIRouter {
 
         $prompts = PromptData::buildPrompts($keyword, $naver_data, $internal_links, $contentMin, $contentMax, null, $imageCount);
         $maxTokens = max(16384, min(65536, (int)($contentMax * 3.5) + 4000));
-        $originalModel = getKey("{$providerKey}.model");
+        $model = getKey("{$providerKey}.model");
+        write_log("AI 호출: {$provider->getName()} (지정) [모델:{$model}, max_tokens:{$maxTokens}]");
 
-        // ── 플랫폼별 대체 모델 목록 (현재 모델 제외, 저비용→고비용 순) ──
-        $fallbackModels = [
-            'gemini'  => ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro'],
-            'grok'    => ['grok-3-mini-fast', 'grok-3-mini', 'grok-4-1-fast', 'grok-4-fast', 'grok-3', 'grok-4'],
-            'chatgpt' => ['gpt-5.4-mini', 'gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o', 'gpt-4.1'],
-            'claude'  => ['claude-haiku-4-5-20251001', 'claude-sonnet-4-5-20250929'],
-        ];
-
-        // ── 시도 1: 원래 모델로 호출 ──
-        write_log("AI 호출: {$provider->getName()} (지정) [모델:{$originalModel}, max_tokens:{$maxTokens}]");
+        // ── 1차 시도 ──
         $result = $this->tryCallAndParse($provider, $providerKey, $prompts, $maxTokens);
         if ($result) return $result;
 
-        // ── 시도 2: 같은 모델로 10초 후 재시도 (타임아웃/일시장애 대응) ──
-        write_log("🔄 {$providerKey} 1차 실패 → 같은 모델({$originalModel})로 10초 후 재시도...");
+        // ── 2차 시도: 같은 모델로 10초 후 1회만 재시도 ──
+        write_log("🔄 {$providerKey}({$model}) 1차 실패 → 같은 모델로 10초 후 재시도...");
         sleep(10);
         $result = $this->tryCallAndParse($provider, $providerKey, $prompts, $maxTokens);
         if ($result) return $result;
 
-        // ── 시도 3: 같은 플랫폼의 대체 모델로 1회 시도 ──
-        $altModels = $fallbackModels[$providerKey] ?? [];
-        $altModels = array_filter($altModels, fn($m) => $m !== $originalModel); // 현재 모델 제외
-        if (!empty($altModels)) {
-            $altModel = reset($altModels); // 첫 번째 대체 모델 선택
-            write_log("🔄 {$providerKey} 2차 실패 → 같은 플랫폼 대체 모델({$altModel})로 시도...");
-
-            // 임시로 모델 변경
-            $keys = loadApiKeys();
-            $keys[$providerKey]['model'] = $altModel;
-            saveApiKeys($keys);
-
-            // 새 프로바이더 인스턴스로 호출 (변경된 모델 반영)
-            $altProvider = $providerMap[$providerKey];
-            $altMaxTokens = clampMaxTokens($altModel, $maxTokens);
-            $result = $this->tryCallAndParse($altProvider, $providerKey, $prompts, $altMaxTokens);
-
-            // 원래 모델로 복원
-            $keys = loadApiKeys();
-            $keys[$providerKey]['model'] = $originalModel;
-            saveApiKeys($keys);
-
-            if ($result) {
-                write_log("✅ 대체 모델({$altModel})로 성공!");
-                return $result;
-            }
-        }
-
-        write_log("❌ {$providerKey} 최종 실패 (같은 플랫폼 내 재시도 모두 실패) → 글 생성 중단");
+        write_log("❌ {$providerKey}({$model}) 최종 실패 → 글 생성 중단");
         return null;
     }
 
     /**
-     * API 호출 + JSON 파싱 + 비용 기록을 한 번에 처리하는 헬퍼
+     * API 호출 + JSON 파싱 + 비용 기록 헬퍼
      */
     private function tryCallAndParse($provider, $providerKey, $prompts, $maxTokens) {
         $response = $provider->callAPI($prompts['system'], $prompts['user'], $maxTokens);

@@ -1,0 +1,174 @@
+name: 자동 블로그 발행
+on:
+  workflow_dispatch:
+    inputs:
+      site:
+        description: '특정 사이트만 (0,1,2... 비우면 전체)'
+        required: false
+        default: ''
+      ai:
+        description: 'AI 선택 (gemini/claude/chatgpt)'
+        required: false
+        default: 'gemini'
+  repository_dispatch:
+    types: [publish-job, choco-job, continue-job]
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+      - name: PHP 설치
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: curl, gd, mbstring, json
+      - name: API 키 복원
+        run: echo '${{ secrets.API_KEYS_JSON }}' > api_keys.json
+
+      # ★ v7: 서버에서 최신 모델 설정 가져와서 병합
+      # 관리자 페이지에서 모델 변경하면 GitHub Actions에도 자동 반영
+      - name: 서버 모델 설정 동기화
+        run: |
+          CALLBACK_URL="${{ github.event.client_payload.callback_url }}"
+          CALLBACK_TOKEN="${{ github.event.client_payload.callback_token }}"
+          if [ -n "$CALLBACK_URL" ] && [ -n "$CALLBACK_TOKEN" ]; then
+            echo "📡 서버에서 최신 모델 설정 가져오는 중..."
+            RESP=$(curl -s -X POST "${CALLBACK_URL}?action=gh_callback" \
+              -H "Content-Type: application/json" \
+              -d "{\"type\":\"get_models\",\"token\":\"${CALLBACK_TOKEN}\"}" \
+              --max-time 10 || echo "")
+            if echo "$RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d.get('ok')" 2>/dev/null; then
+              echo "$RESP" | python3 -c "
+          import json, sys
+          resp = json.load(sys.stdin)
+          models = resp.get('models', {})
+          if not models:
+              print('⚠️ 모델 데이터 없음 → Secrets 값 유지')
+              sys.exit(0)
+          with open('api_keys.json', 'r') as f:
+              keys = json.load(f)
+          changed = []
+          for ai_name, model_info in models.items():
+              if ai_name in keys:
+                  if 'model' in model_info and model_info['model'] != keys[ai_name].get('model',''):
+                      keys[ai_name]['model'] = model_info['model']
+                      changed.append(f'{ai_name}: {model_info[\"model\"]}')
+                  if 'image_model' in model_info and model_info['image_model'] != keys[ai_name].get('image_model',''):
+                      keys[ai_name]['image_model'] = model_info['image_model']
+                      changed.append(f'{ai_name} 이미지: {model_info[\"image_model\"]}')
+          if changed:
+              with open('api_keys.json', 'w') as f:
+                  json.dump(keys, f, ensure_ascii=False, indent=4)
+              print('✅ 모델 설정 동기화 완료:')
+              for c in changed:
+                  print(f'  → {c}')
+          else:
+              print('✅ 모델 설정 변경 없음')
+          "
+            else
+              echo "⚠️ 서버 응답 실패 → Secrets 값 유지"
+            fi
+          else
+            echo "ℹ️ 콜백 URL 없음 → Secrets 값 유지"
+          fi
+
+      - name: 디렉토리 생성
+        run: mkdir -p tmp_images local_images logs data/prompts fonts
+
+      - name: Job 데이터 복원 (repository_dispatch - 블로그)
+        if: github.event_name == 'repository_dispatch' && github.event.client_payload.event_type != 'choco-job' && github.event.client_payload.job_data != ''
+        run: |
+          JOB_DATA_B64="${{ github.event.client_payload.job_data }}"
+          if [ -n "$JOB_DATA_B64" ]; then
+            echo "$JOB_DATA_B64" | base64 -d > /tmp/new_job.json
+            if [ -f jobs.json ] && python3 -c "import json; json.load(open('jobs.json'))" 2>/dev/null; then
+              python3 -c "
+          import json, sys
+          try:
+              with open('jobs.json','r') as f:
+                  jobs = json.load(f)
+          except:
+              jobs = []
+          with open('/tmp/new_job.json','r') as f:
+              new_job = json.load(f)
+          found = False
+          for i, j in enumerate(jobs):
+              if j.get('id') == new_job.get('id'):
+                  jobs[i] = new_job
+                  found = True
+                  break
+          if not found:
+              jobs.append(new_job)
+          with open('jobs.json','w') as f:
+              json.dump(jobs, f, ensure_ascii=False, indent=2)
+          print(f'Job {new_job.get(\"id\")} 복원 완료 (총 {len(jobs)}건)')
+          "
+            else
+              echo "[$(cat /tmp/new_job.json)]" > jobs.json
+              echo "jobs.json 새로 생성"
+            fi
+            echo "--- jobs.json 확인 ---"
+            python3 -c "import json; data=json.load(open('jobs.json')); print(f'Jobs: {len(data)}건'); [print(f'  - {j[\"id\"]}: {j[\"name\"]} ({len(j.get(\"posts\",[]))}글)') for j in data]"
+          fi
+
+      - name: 초코365 Job 복원
+        if: github.event_name == 'repository_dispatch' && github.event.client_payload.event_type == 'choco-job'
+        run: |
+          echo '${{ github.event.client_payload.job_data }}' | base64 -d > /tmp/choco_job.json
+          echo "--- 초코365 Job 확인 ---"
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/choco_job.json'))
+          print(f'카테고리: {d.get(\"cat\")} | AI: {d.get(\"ai_mode\")} | 주제: {len(d.get(\"topics\",[]))}건')
+          for i, t in enumerate(d.get('topics',[])):
+              print(f'  [{i+1}] {t}')
+          "
+
+      - name: 자동 발행 실행
+        run: |
+          SITE_OPT=""
+          AI_OPT=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            [ -n "${{ github.event.inputs.site }}" ] && SITE_OPT="--site=${{ github.event.inputs.site }}"
+            [ -n "${{ github.event.inputs.ai }}" ] && AI_OPT="--ai=${{ github.event.inputs.ai }}"
+          fi
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            export CALLBACK_URL="${{ github.event.client_payload.callback_url }}"
+            export CALLBACK_TOKEN="${{ github.event.client_payload.callback_token }}"
+
+            # 초코365 Job
+            if [ "${{ github.event.client_payload.event_type }}" = "choco-job" ]; then
+              echo "🍫 초코365 테스트 생성 모드"
+              php choco_generate.php --job=/tmp/choco_job.json
+              exit $?
+            fi
+
+            # 블로그 발행 Job (신규 또는 이어하기 모두 동일하게 처리)
+            JOB_ID="${{ github.event.client_payload.job_id }}"
+            if [ -n "$JOB_ID" ]; then
+              echo "📋 Job 실행: $JOB_ID (pending 글만 처리)"
+              php auto_publish.php --job=$JOB_ID
+              exit $?
+            fi
+          fi
+          php auto_publish.php $SITE_OPT $AI_OPT
+        env:
+          TZ: Asia/Seoul
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: 변경사항 커밋
+        if: github.event.client_payload.event_type != 'choco-job'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add keywords.txt keywords_site_0.txt jobs.json || true
+          git reset api_keys.json || true
+          git diff --staged --quiet || (git commit -m "자동발행 완료: $(date '+%Y-%m-%d %H:%M') KST" && git push) || true
+      - name: 로그 저장
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: publish-log-${{ github.run_number }}-${{ github.run_attempt }}
+          path: publish_log.txt
+          retention-days: 7

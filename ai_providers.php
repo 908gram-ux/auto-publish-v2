@@ -198,6 +198,22 @@ class ChatGPTProvider implements AIProvider {
         }
         write_log("ChatGPT 모델 확인: {$model}");
         $maxTokens = clampMaxTokens($model, $maxTokens);
+
+        // ★ v7: gpt-5, o4 시리즈는 max_tokens 대신 max_completion_tokens 사용
+        $useNewParam = (strpos($model, 'gpt-5') !== false || strpos($model, 'o4-') !== false || strpos($model, 'o3-') !== false);
+        $body = [
+            'model' => $model,
+            'messages' => [
+                ['role' => 'system', 'content' => $system],
+                ['role' => 'user', 'content' => $user],
+            ],
+        ];
+        if ($useNewParam) {
+            $body['max_completion_tokens'] = $maxTokens;
+        } else {
+            $body['max_tokens'] = $maxTokens;
+        }
+
         $ch = curl_init('https://api.openai.com/v1/chat/completions');
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_TIMEOUT => 120,
@@ -205,14 +221,7 @@ class ChatGPTProvider implements AIProvider {
                 'Content-Type: application/json',
                 'Authorization: Bearer ' . getKey('chatgpt.api_key'),
             ],
-            CURLOPT_POSTFIELDS => json_encode([
-                'model' => $model,
-                'max_tokens' => $maxTokens,
-                'messages' => [
-                    ['role' => 'system', 'content' => $system],
-                    ['role' => 'user', 'content' => $user],
-                ],
-            ]),
+            CURLOPT_POSTFIELDS => json_encode($body),
         ]);
         $resp = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
         if ($code !== 200) { write_log("ChatGPT HTTP {$code}: " . mb_substr($resp, 0, 300)); return null; }

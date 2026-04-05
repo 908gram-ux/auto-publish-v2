@@ -26,6 +26,54 @@ jobs:
           extensions: curl, gd, mbstring, json
       - name: API 키 복원
         run: echo '${{ secrets.API_KEYS_JSON }}' > api_keys.json
+
+      # ★ v7: 서버에서 최신 모델 설정 가져와서 병합
+      # 관리자 페이지에서 모델 변경하면 GitHub Actions에도 자동 반영
+      - name: 서버 모델 설정 동기화
+        run: |
+          CALLBACK_URL="${{ github.event.client_payload.callback_url }}"
+          CALLBACK_TOKEN="${{ github.event.client_payload.callback_token }}"
+          if [ -n "$CALLBACK_URL" ] && [ -n "$CALLBACK_TOKEN" ]; then
+            echo "📡 서버에서 최신 모델 설정 가져오는 중..."
+            RESP=$(curl -s -X POST "${CALLBACK_URL}?action=gh_callback" \
+              -H "Content-Type: application/json" \
+              -d "{\"type\":\"get_models\",\"token\":\"${CALLBACK_TOKEN}\"}" \
+              --max-time 10 || echo "")
+            if echo "$RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d.get('ok')" 2>/dev/null; then
+              echo "$RESP" | python3 -c "
+          import json, sys
+          resp = json.load(sys.stdin)
+          models = resp.get('models', {})
+          if not models:
+              print('⚠️ 모델 데이터 없음 → Secrets 값 유지')
+              sys.exit(0)
+          with open('api_keys.json', 'r') as f:
+              keys = json.load(f)
+          changed = []
+          for ai_name, model_info in models.items():
+              if ai_name in keys:
+                  if 'model' in model_info and model_info['model'] != keys[ai_name].get('model',''):
+                      keys[ai_name]['model'] = model_info['model']
+                      changed.append(f'{ai_name}: {model_info[\"model\"]}')
+                  if 'image_model' in model_info and model_info['image_model'] != keys[ai_name].get('image_model',''):
+                      keys[ai_name]['image_model'] = model_info['image_model']
+                      changed.append(f'{ai_name} 이미지: {model_info[\"image_model\"]}')
+          if changed:
+              with open('api_keys.json', 'w') as f:
+                  json.dump(keys, f, ensure_ascii=False, indent=4)
+              print('✅ 모델 설정 동기화 완료:')
+              for c in changed:
+                  print(f'  → {c}')
+          else:
+              print('✅ 모델 설정 변경 없음')
+          "
+            else
+              echo "⚠️ 서버 응답 실패 → Secrets 값 유지"
+            fi
+          else
+            echo "ℹ️ 콜백 URL 없음 → Secrets 값 유지"
+          fi
+
       - name: 디렉토리 생성
         run: mkdir -p tmp_images local_images logs data/prompts fonts
 

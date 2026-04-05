@@ -47,6 +47,33 @@ if (($_GET['action'] ?? '') === 'gh_callback' || ($_POST['action'] ?? '') === 'g
             }
         }
     }
+
+    // ★ v7: check_stop — GitHub Actions에서 서버에 중지 여부 확인
+    // auto_publish.php의 isJobStopped() 함수가 이 콜백을 호출
+    if ($cbType === 'check_stop') {
+        $isStopped = false;
+        if ($cbJobId) {
+            $job = getJob($cbJobId);
+            $isStopped = $job && in_array($job['status'] ?? '', ['stopped', 'failed']);
+        }
+        echo json_encode(['ok' => true, 'stopped' => $isStopped]);
+        exit;
+    }
+
+    // ★ v7: get_models — GitHub Actions 실행 시 서버의 최신 모델 설정 가져오기
+    // 관리자 페이지에서 모델을 변경하면 GitHub Actions에도 자동 반영됨
+    if ($cbType === 'get_models') {
+        $keys = loadApiKeys();
+        $models = [];
+        foreach (['claude', 'grok', 'chatgpt', 'gemini'] as $ai) {
+            $models[$ai] = [
+                'model' => $keys[$ai]['model'] ?? '',
+                'image_model' => $keys[$ai]['image_model'] ?? '',
+            ];
+        }
+        echo json_encode(['ok' => true, 'models' => $models]);
+        exit;
+    }
     
     if ($cbJobId && $cbType === 'post_done') {
         $pi = intval($input['post_idx'] ?? -1);

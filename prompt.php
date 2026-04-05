@@ -16,6 +16,26 @@ require_once __DIR__ . '/config.php';
 
 class PromptData {
 
+    // ── CTA 버튼 스타일 풀 (랜덤 선택으로 단조로움 방지) ──
+    public static $buttonStyles = [
+        '👉', '✅', '📌', '🔍', '💡', '📎', '🎯', '⭐', '🏷️', '📢',
+        '🔗', '📖', '🛒', '💬', '🚀', '🎁', '📝', '🔥', '💰', '⚡',
+    ];
+
+    // ── 버튼 텍스트 패턴 (다양한 톤) ──
+    public static $buttonTextPatterns = [
+        '공식 사이트에서 확인하기',
+        '자세한 내용 보러 가기',
+        '여기서 직접 확인해보세요',
+        '더 알아보기',
+        '관련 정보 바로가기',
+        '이 링크에서 확인 가능해요',
+        '원문 보기',
+        '상세 페이지로 이동',
+        '참고 자료 확인하기',
+        '관련 사이트 방문하기',
+    ];
+
     // ── 글 전체의 성격을 결정하는 페르소나 (상황 기반) ──
     public static $personas = [
         '네이버 블로그에 글 올리는 30대 직장인. 퇴근 후 관심사에 대해 정리하는 스타일. 반말과 존댓말을 자연스럽게 섞고, 중간중간 "솔직히", "근데 진짜" 같은 구어체를 쓴다.',
@@ -147,6 +167,20 @@ class PromptData {
         // ★ v5: 프롬프트 세트 롤링
         $promptSet = self::$promptSets[array_rand(self::$promptSets)];
 
+        // ★ v7: 버튼 스타일 랜덤 선택
+        $btnEmoji = self::$buttonStyles[array_rand(self::$buttonStyles)];
+        $btnTextSample = self::$buttonTextPatterns[array_rand(self::$buttonTextPatterns)];
+
+        // ★ v7: 문장 어미 풀 (랜덤 3개 선택해서 프롬프트에 포함)
+        $endings = ['~거든요', '~더라고요', '~인 셈이죠', '~보세요', '~같아요', '~답니다', '~했어요', '~네요', '~이에요', '~잖아요', '~될 수 있어요', '~할걸요'];
+        shuffle($endings);
+        $endingSamples = implode(', ', array_slice($endings, 0, 5));
+
+        // ★ v7: 전환어 풀 (랜덤 선택)
+        $transitions = ['근데 여기서 중요한 건', '솔직히 말하면', '아 그리고', '한 가지 더', '참고로', '여기서 잠깐', '사실 이게 핵심인데', '덧붙이자면', '이건 좀 의외인데', '재밌는 건', '그나저나'];
+        shuffle($transitions);
+        $transitionSamples = implode(', ', array_slice($transitions, 0, 4));
+
         // ★ 분량별 구조 자동 계산
         $volStruct = self::calcStructure($contentMin);
 
@@ -216,6 +250,8 @@ class PromptData {
 1. {$rules[0]}
 2. {$rules[1]}
 3. {$rules[2]}
+4. 문장 어미를 다양하게 섞어라: {$endingSamples} 등을 골고루 사용. 같은 어미 2번 연속 금지.
+5. 문단 전환 시 이런 표현을 자연스럽게 써라: {$transitionSamples} — "그리고", "또한", "한편" 같은 딱딱한 접속사는 피해라.
 
 [⛔⛔ 절대 금지 — AI 티가 나는 표현 (하나라도 쓰면 실격) ⛔⛔]
 아래 표현은 단 한 번도 사용하지 마라:
@@ -251,9 +287,10 @@ class PromptData {
 [★ CTA 버튼 — 독자 행동 유도 블록 (반드시 넣어라)]
 - 본문 중간이나 끝에 독자가 클릭할 수 있는 행동 유도 버튼을 반드시 1~2개 삽입
 - 형식: [BUTTON:버튼텍스트|URL]
-- 예시: [BUTTON:👉 공식 사이트에서 자세히 보기|https://www.gov.kr]
+- 예시: [BUTTON:{$btnEmoji} {$btnTextSample}|https://example.com]
 - 참고자료에 제공된 실제 URL만 사용. 없는 URL 만들지 마라.
-- 버튼 텍스트는 10~25자. 이모지 1개 넣으면 클릭률이 올라감.
+- 버튼 텍스트는 10~25자. 이모지 1개 넣되, 매번 다른 이모지를 써라. ({$btnEmoji} 같은 걸 참고하되 동일하게 쓰지 마라)
+- 같은 버튼 문구를 여러 글에서 반복하지 마라. 글 맥락에 맞는 자연스러운 문구를 직접 만들어라.
 - 글 중간(50~70% 지점)에 1개, 글 마지막에 1개 배치.
 - ⛔ [BUTTON:] 태그가 0개면 실격. 반드시 1개 이상 넣어라.
 

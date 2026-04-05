@@ -21,8 +21,12 @@ function getModelMaxTokens(string $model): int {
         'grok-3-mini' => 16384,
         'grok-3' => 16384,
         'grok-4-1-fast' => 16384,
+        'grok-4-1-fast-non-reasoning' => 131072,
+        'grok-4-1-fast-reasoning' => 131072,
         'grok-4-fast' => 16384,
-        'grok-4' => 16384,
+        'grok-4-fast-non-reasoning' => 131072,
+        'grok-4-fast-reasoning' => 131072,
+        'grok-4' => 131072,
         // ── ChatGPT ──
         'gpt-4o-mini' => 16384,
         'gpt-4o' => 16384,
@@ -135,26 +139,35 @@ class GrokProvider implements AIProvider {
 
     public function callAPI($system, $user, $maxTokens = 8192): ?string {
         $this->lastUsage = ['input'=>0, 'output'=>0];
-        $model = getKey('grok.model', 'grok-3');
+        $model = getKey('grok.model', 'grok-3-mini-fast');
         $maxTokens = clampMaxTokens($model, $maxTokens);
+
+        // ★ v7: Grok 4 시리즈는 reasoning 모델 → max_completion_tokens 사용
+        $isGrok4 = (strpos($model, 'grok-4') !== false);
+        $body = [
+            'model' => $model,
+            'messages' => [
+                ['role' => 'system', 'content' => $system],
+                ['role' => 'user', 'content' => $user],
+            ],
+        ];
+        if ($isGrok4) {
+            $body['max_completion_tokens'] = $maxTokens;
+        } else {
+            $body['max_tokens'] = $maxTokens;
+        }
+
         $ch = curl_init('https://api.x.ai/v1/chat/completions');
         curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_TIMEOUT => 120,
+            CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_TIMEOUT => 180,
             CURLOPT_HTTPHEADER => [
                 'Content-Type: application/json',
                 'Authorization: Bearer ' . getKey('grok.api_key'),
             ],
-            CURLOPT_POSTFIELDS => json_encode([
-                'model' => $model,
-                'max_tokens' => $maxTokens,
-                'messages' => [
-                    ['role' => 'system', 'content' => $system],
-                    ['role' => 'user', 'content' => $user],
-                ],
-            ]),
+            CURLOPT_POSTFIELDS => json_encode($body),
         ]);
         $resp = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
-        if ($code !== 200) { write_log("Grok HTTP {$code}: " . mb_substr($resp, 0, 300)); return null; }
+        if ($code !== 200) { write_log("Grok HTTP {$code} [모델:{$model}]: " . mb_substr($resp, 0, 500)); return null; }
         $r = json_decode($resp, true);
         $this->lastUsage = ['input' => $r['usage']['prompt_tokens'] ?? 0, 'output' => $r['usage']['completion_tokens'] ?? 0];
         return $r['choices'][0]['message']['content'] ?? null;
@@ -177,7 +190,13 @@ class ChatGPTProvider implements AIProvider {
 
     public function callAPI($system, $user, $maxTokens = 8192): ?string {
         $this->lastUsage = ['input'=>0, 'output'=>0];
-        $model = getKey('chatgpt.model', 'gpt-4o');
+        $model = getKey('chatgpt.model', '');
+        // ★ v7: 모델 미설정 시 명확한 에러 (gpt-4o 자동 폴백 방지)
+        if (empty($model)) {
+            write_log("❌ ChatGPT 모델이 설정되지 않았습니다! API 관리에서 모델을 선택하세요.");
+            return null;
+        }
+        write_log("ChatGPT 모델 확인: {$model}");
         $maxTokens = clampMaxTokens($model, $maxTokens);
         $ch = curl_init('https://api.openai.com/v1/chat/completions');
         curl_setopt_array($ch, [

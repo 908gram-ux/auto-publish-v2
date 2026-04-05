@@ -155,6 +155,49 @@ function ghProgress($jobId, $message) {
     ghCallback('post_progress', ['job_id' => $jobId, 'message' => $message]);
 }
 
+/**
+ * ★ v7: Job 중지 상태 체크
+ * 매 글 처리 전에 호출하여, 관리자가 중지 버튼을 누른 경우 즉시 종료
+ * - 로컬 실행: jobs.json에서 직접 상태 확인
+ * - GitHub Actions: 콜백 URL로 서버에 상태 질의
+ */
+function isJobStopped(string $jobId): bool {
+    // 방법 1: 로컬 jobs.json 직접 확인 (서버 로컬 실행 시)
+    if (!getenv('GITHUB_ACTIONS')) {
+        $job = getJob($jobId);
+        return $job && in_array($job['status'] ?? '', ['stopped', 'failed']);
+    }
+
+    // 방법 2: GitHub Actions 환경 → 서버에 콜백으로 상태 질의
+    $cbUrl = getenv('CALLBACK_URL');
+    $cbToken = getenv('CALLBACK_TOKEN');
+    if (!$cbUrl || !$cbToken) return false;
+
+    $ch = curl_init($cbUrl . '?action=gh_callback');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
+        CURLOPT_TIMEOUT => 8,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+        CURLOPT_POSTFIELDS => json_encode([
+            'type' => 'check_stop',
+            'token' => $cbToken,
+            'job_id' => $jobId,
+        ]),
+    ]);
+    $resp = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($code === 200) {
+        $data = json_decode($resp, true);
+        if (!empty($data['stopped'])) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // ═════════════════════════════════════════
 // 메인 실행
 // ═════════════════════════════════════════
@@ -267,6 +310,21 @@ if (isset($opts['job'])) {
     $ok = 0; $fail = 0;
 
     foreach ($pendingPosts as $idx => $postIdx) {
+        // ★ v7: 중지 상태 체크 — 관리자가 중지 버튼 누르면 즉시 중단
+        if (isJobStopped($jobId)) {
+            $remaining = count($pendingPosts) - $idx;
+            write_log("🛑 작업 중지 감지! 남은 {$remaining}개 글 중단");
+            ghProgress($jobId, "🛑 작업 중지됨 — 남은 {$remaining}개 글 중단");
+            // 남은 pending 글들을 failed 처리
+            for ($si = $idx; $si < count($pendingPosts); $si++) {
+                updateJobPost($jobId, $pendingPosts[$si], ['status' => 'failed', 'error' => '사용자 강제 중지 (원격)']);
+            }
+            updateJob($jobId, ['status' => 'stopped']);
+            write_log("══════ 작업 중지: 성공 {$ok} / 실패 {$fail} / 중단 {$remaining} ══════");
+            ghCallback('job_done', ['job_id' => $jobId, 'ok' => $ok, 'fail' => $fail, 'stopped' => true]);
+            exit(0);
+        }
+
         // ★ 타임아웃 체크: 3시간 30분 지나면 남은 글을 새 워크플로우로 넘김
         if (isTimeRunningOut()) {
             $remaining = count($pendingPosts) - $idx;

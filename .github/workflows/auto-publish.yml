@@ -156,7 +156,8 @@ jobs:
           php auto_publish.php $SITE_OPT $AI_OPT
         env:
           TZ: Asia/Seoul
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
       - name: 변경사항 커밋
         if: github.event.client_payload.event_type != 'choco-job'
         run: |

@@ -643,13 +643,13 @@ class AIRouter {
         if (empty($data['slug'])) {
             $data['slug'] = $this->generateEnglishSlug($data['title'], $data['focus_keyphrase'] ?? '');
         }
-        // slug 정규화 (소문자, 하이픈, 특수문자 제거)
-        $data['slug'] = preg_replace('/[^a-z0-9\-]/', '', strtolower(str_replace(' ', '-', $data['slug'])));
-        $data['slug'] = preg_replace('/-+/', '-', trim($data['slug'], '-'));
-        // 너무 길면 자르기 (최대 60자)
-        if (strlen($data['slug']) > 60) {
-            $data['slug'] = substr($data['slug'], 0, 60);
-            $data['slug'] = preg_replace('/-[^-]*$/', '', $data['slug']); // 단어 중간 잘림 방지
+        // slug 정규화 (소문자, 하이픈, 언더스코어, 특수문자 제거)
+        $data['slug'] = preg_replace('/[^a-z0-9\-_]/', '', strtolower(str_replace(' ', '-', $data['slug'])));
+        $data['slug'] = preg_replace('/[-_]{2,}/', '_', trim($data['slug'], '-_'));
+        // 최대 30자
+        if (strlen($data['slug']) > 30) {
+            $data['slug'] = substr($data['slug'], 0, 30);
+            $data['slug'] = preg_replace('/[-_][^-_]*$/', '', $data['slug']); // 단어 중간 잘림 방지
         }
 
         return $data;
@@ -713,17 +713,80 @@ class AIRouter {
     }
 
     /**
-     * 제목/키워드에서 영문 slug 생성
+     * 제목/키워드에서 짧은 영문 slug 생성
+     * 형식: 핵심키워드_랜덤8자 (예: koreanwar_a3x7k2m9)
+     * AI API 사용하지 않음 — 한글→영문 매핑 테이블로 처리
      */
     private function generateEnglishSlug($title, $keyword = '') {
-        // 영문 단어만 추출
         $source = $keyword ?: $title;
-        preg_match_all('/[a-zA-Z0-9]+/', $source, $matches);
-        if (!empty($matches[0])) {
-            return strtolower(implode('-', array_slice($matches[0], 0, 5)));
+
+        // 1) 영문 단어가 있으면 그대로 사용 (최대 2단어)
+        preg_match_all('/[a-zA-Z]{2,}/', $source, $enMatches);
+        if (!empty($enMatches[0])) {
+            $prefix = strtolower(implode('', array_slice($enMatches[0], 0, 2)));
+        } else {
+            // 2) 한글 키워드 → 간단 로마자 변환 (초성+모음 기반, 짧게)
+            $prefix = $this->korToShortSlug($source);
         }
-        // 영문이 전혀 없으면 타임스탬프 기반
-        return 'post-' . date('Ymd-His');
+
+        // prefix 최대 15자로 제한
+        $prefix = substr($prefix, 0, 15);
+        $prefix = rtrim($prefix, '-_');
+
+        // 빈 prefix 방지
+        if (empty($prefix)) $prefix = 'post';
+
+        // 3) 랜덤 suffix 8자 (영문소문자+숫자)
+        $chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+        $suffix = '';
+        for ($i = 0; $i < 8; $i++) {
+            $suffix .= $chars[random_int(0, strlen($chars) - 1)];
+        }
+
+        return $prefix . '_' . $suffix;
+    }
+
+    /**
+     * 한글 문자열 → 짧은 로마자 slug
+     * 핵심 단어만 추출하여 짧게 변환 (최대 2~3 단어)
+     */
+    private function korToShortSlug(string $text): string {
+        // 한글 음절 → 초성+중성 기반 간략 로마자
+        $chosung = ['g','kk','n','d','tt','r','m','b','pp','s','ss','','j','jj','ch','k','t','p','h'];
+        $jungsung = ['a','ae','ya','yae','eo','e','yeo','ye','o','wa','wae','oe','yo','u','wo','we','wi','yu','eu','ui','i'];
+
+        // 불용어 (조사, 접속사 등)
+        $stopWords = ['은','는','이','가','을','를','의','에','에서','로','으로','와','과','도','만','까지',
+                       '부터','에게','한테','보다','처럼','같은','대한','위한','통한','그리고','하지만','그러나',
+                       '또한','그래서','때문에','이런','저런','모든','매우','정말','진짜','완전','아주'];
+
+        // 한글 단어 추출
+        preg_match_all('/[가-힣]+/', $text, $matches);
+        if (empty($matches[0])) return '';
+
+        // 불용어 제거 후 상위 2단어
+        $words = array_filter($matches[0], function($w) use ($stopWords) {
+            return mb_strlen($w) >= 2 && !in_array($w, $stopWords);
+        });
+        $words = array_values($words);
+        $words = array_slice($words, 0, 2);
+
+        $result = [];
+        foreach ($words as $word) {
+            $slug = '';
+            $len = mb_strlen($word);
+            for ($i = 0; $i < $len && $i < 4; $i++) { // 단어당 최대 4글자만
+                $char = mb_substr($word, $i, 1);
+                $code = mb_ord($char) - 0xAC00;
+                if ($code < 0 || $code > 11171) continue;
+                $cho = intdiv($code, 21 * 28);
+                $jung = intdiv($code % (21 * 28), 28);
+                $slug .= ($chosung[$cho] ?? '') . ($jungsung[$jung] ?? '');
+            }
+            if ($slug) $result[] = $slug;
+        }
+
+        return implode('', $result);
     }
 
     /**

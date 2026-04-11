@@ -144,7 +144,8 @@ if (($_GET['action'] ?? '') === 'gh_callback' || ($_POST['action'] ?? '') === 'g
                 
                 // 이어하기 트리거 (continue_job 로직 재사용)
                 $ghToken = getKey('github.token');
-                $ghRepo = getKey('github.repo');
+                $ghOwner = getKey('github.owner');
+                $ghRepo = $ghOwner ? ($ghOwner . '/' . getKey('github.repo')) : getKey('github.repo');
                 if ($ghToken && $ghRepo) {
                     // ★ payload 경량화: pending 글만 추출 + 필수 필드만
                     $lightJob = $serverJob;
@@ -251,7 +252,8 @@ if (($_GET['action'] ?? '') === 'gh_callback' || ($_POST['action'] ?? '') === 'g
         $job = getJob($cbJobId);
         if ($job) {
             $ghToken = getKey('github.token');
-            $ghRepo = getKey('github.repo');
+            $ghOwner = getKey('github.owner');
+            $ghRepo = $ghOwner ? ($ghOwner . '/' . getKey('github.repo')) : getKey('github.repo');
             if ($ghToken && $ghRepo) {
                 $jobDataB64 = base64_encode(json_encode($job, JSON_UNESCAPED_UNICODE));
                 $cbUrl = getKey('github.callback_url', '');

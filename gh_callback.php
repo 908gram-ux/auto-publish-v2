@@ -124,15 +124,126 @@ if (($_GET['action'] ?? '') === 'gh_callback' || ($_POST['action'] ?? '') === 'g
             $remaining = $input['remaining'] ?? '?';
             file_put_contents($logFile, "\n[{$t}] 🔄 타임아웃 임박 → 남은 {$remaining}개 자동 이어하기 (성공 " . ($input['ok']??0) . " / 실패 " . ($input['fail']??0) . ")\n\n", FILE_APPEND);
         } else {
-            updateJob($cbJobId, ['status' => 'done']);
-            $logFile = ROOT_DIR . '/logs/job_' . $cbJobId . '.log';
-            $t = date('H:i:s');
-            file_put_contents($logFile, "\n[{$t}] 🐙 GitHub Actions 작업 완료!\n", FILE_APPEND);
+            // ★ v9 FIX: job_done 수신 시 서버 jobs.json에 pending 글이 남아있는지 확인
+            // payload 분할로 일부만 보냈을 때, 나머지를 자동 이어하기
+            $serverJob = getJob($cbJobId);
+            $pendingRemain = 0;
+            if ($serverJob) {
+                foreach ($serverJob['posts'] ?? [] as $sp) {
+                    if (($sp['status'] ?? '') === 'pending') $pendingRemain++;
+                }
+            }
+            
+            if ($pendingRemain > 0) {
+                // 아직 pending 글이 남아있음 → 자동 이어하기 트리거
+                updateJob($cbJobId, ['status' => 'continuing']);
+                $logFile = ROOT_DIR . '/logs/job_' . $cbJobId . '.log';
+                $t = date('H:i:s');
+                file_put_contents($logFile, "\n[{$t}] 🐙 이번 배치 완료 (성공 " . ($input['ok']??0) . " / 실패 " . ($input['fail']??0) . ")\n", FILE_APPEND);
+                file_put_contents($logFile, "[{$t}] 📦 서버에 pending {$pendingRemain}개 남음 → 자동 이어하기 트리거\n", FILE_APPEND);
+                
+                // 이어하기 트리거 (continue_job 로직 재사용)
+                $ghToken = getKey('github.token');
+                $ghRepo = getKey('github.repo');
+                if ($ghToken && $ghRepo) {
+                    // ★ payload 경량화: pending 글만 추출 + 필수 필드만
+                    $lightJob = $serverJob;
+                    $lightPosts = [];
+                    foreach ($serverJob['posts'] as $sp) {
+                        if (($sp['status'] ?? '') !== 'pending') continue;
+                        $lightPosts[] = [
+                            'keyword' => $sp['keyword'],
+                            'title' => $sp['title'] ?? '',
+                            'site_idx' => $sp['site_idx'] ?? 0,
+                            'category_id' => $sp['category_id'] ?? 0,
+                            'ai_mode' => $sp['ai_mode'] ?? 'random',
+                            'image_source' => $sp['image_source'] ?? 'none',
+                            'image_count' => $sp['image_count'] ?? 1,
+                            'content_min' => $sp['content_min'] ?? 2500,
+                            'content_max' => $sp['content_max'] ?? 4000,
+                            'delay_min' => $sp['delay_min'] ?? 0,
+                            'delay_max' => $sp['delay_max'] ?? 0,
+                            'status' => 'pending',
+                        ];
+                    }
+                    $lightJob['posts'] = $lightPosts;
+                    unset($lightJob['custom_prompt']);
+                    
+                    // payload 크기 체크 및 분할
+                    $cbUrl2 = getKey('github.callback_url', '');
+                    $cbTk2 = md5($ghToken . getKey('admin.email'));
+                    $maxPayloadBytes = 55000;
+                    $sendPosts = $lightPosts;
+                    $sendCount = count($lightPosts);
+                    
+                    $testEncoded = base64_encode(json_encode($lightJob, JSON_UNESCAPED_UNICODE));
+                    $testPayload = json_encode(['event_type'=>'continue-job','client_payload'=>['job_id'=>$cbJobId,'job_data'=>$testEncoded,'callback_url'=>$cbUrl2,'callback_token'=>$cbTk2]]);
+                    if (strlen($testPayload) > $maxPayloadBytes) {
+                        // 이진 탐색으로 보낼 수 있는 최대 수 찾기
+                        $lo = 1; $hi = count($lightPosts);
+                        while ($lo < $hi) {
+                            $mid = intval(ceil(($lo + $hi) / 2));
+                            $lightJob['posts'] = array_slice($lightPosts, 0, $mid);
+                            $te = base64_encode(json_encode($lightJob, JSON_UNESCAPED_UNICODE));
+                            $tp = json_encode(['event_type'=>'continue-job','client_payload'=>['job_id'=>$cbJobId,'job_data'=>$te,'callback_url'=>$cbUrl2,'callback_token'=>$cbTk2]]);
+                            if (strlen($tp) <= $maxPayloadBytes) { $lo = $mid; if ($lo === $hi) break; } else { $hi = $mid - 1; }
+                        }
+                        $sendCount = $lo;
+                        file_put_contents($logFile, "[{$t}] 📦 이어하기 payload 분할: {$pendingRemain}개 중 {$sendCount}개만 이번에 전송\n", FILE_APPEND);
+                    }
+                    
+                    $lightJob['posts'] = array_slice($lightPosts, 0, $sendCount);
+                    $jobDataB64 = base64_encode(json_encode($lightJob, JSON_UNESCAPED_UNICODE));
+                    
+                    $dispatchPayload2 = json_encode([
+                        'event_type' => 'continue-job',
+                        'client_payload' => [
+                            'job_id' => $cbJobId,
+                            'job_data' => $jobDataB64,
+                            'callback_url' => $cbUrl2,
+                            'callback_token' => $cbTk2,
+                        ],
+                    ]);
+                    
+                    $ch2 = curl_init("https://api.github.com/repos/{$ghRepo}/dispatches");
+                    curl_setopt_array($ch2, [
+                        CURLOPT_RETURNTRANSFER => true,
+                        CURLOPT_POST => true,
+                        CURLOPT_TIMEOUT => 15,
+                        CURLOPT_HTTPHEADER => [
+                            'Content-Type: application/json',
+                            'Accept: application/vnd.github+json',
+                            "Authorization: Bearer {$ghToken}",
+                            'User-Agent: auto-publish-bot',
+                        ],
+                        CURLOPT_POSTFIELDS => $dispatchPayload2,
+                    ]);
+                    $ghResp2 = curl_exec($ch2);
+                    $ghCode2 = curl_getinfo($ch2, CURLINFO_HTTP_CODE);
+                    curl_close($ch2);
+                    
+                    if ($ghCode2 === 204 || $ghCode2 === 200) {
+                        file_put_contents($logFile, "[{$t}] 🔄 자동 이어하기 워크플로우 트리거 성공 → 남은 {$pendingRemain}개 처리 예정\n\n", FILE_APPEND);
+                    } else {
+                        file_put_contents($logFile, "[{$t}] ⚠️ 자동 이어하기 트리거 실패 (HTTP {$ghCode2}) → 수동 재실행 필요\n\n", FILE_APPEND);
+                        updateJob($cbJobId, ['status' => 'draft']); // 실패 시 draft로 → 수동 재실행 가능
+                    }
+                } else {
+                    file_put_contents($logFile, "[{$t}] ⚠️ GitHub 토큰/레포 미설정 → 자동 이어하기 불가\n\n", FILE_APPEND);
+                    updateJob($cbJobId, ['status' => 'draft']);
+                }
+            } else {
+                // pending 없음 → 정상 완료
+                updateJob($cbJobId, ['status' => 'done']);
+                $logFile = ROOT_DIR . '/logs/job_' . $cbJobId . '.log';
+                $t = date('H:i:s');
+                file_put_contents($logFile, "\n[{$t}] 🐙 GitHub Actions 작업 완료!\n", FILE_APPEND);
+            }
         }
         $statusFile = ROOT_DIR . '/logs/job.status';
         if (file_exists($statusFile)) {
             $st = json_decode(file_get_contents($statusFile), true) ?: [];
-            $st['status'] = ($cbType === 'job_continuing') ? 'continuing' : 'done';
+            $st['status'] = ($cbType === 'job_continuing' || $pendingRemain > 0) ? 'continuing' : 'done';
             file_put_contents($statusFile, json_encode($st));
         }
     } elseif ($cbJobId && $cbType === 'continue_job') {

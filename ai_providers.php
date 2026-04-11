@@ -950,12 +950,47 @@ class AIRouter {
                 continue;
             }
 
-            // ★ v5.1: [BUTTON:텍스트|URL] → 순수 HTML 버튼 (WordPress + 자체CMS 모두 호환)
-            if (preg_match('/^\[BUTTON:\s*(.+?)\s*\|\s*(https?:\/\/[^\]]+)\s*\]$/', $t, $bm)) {
+            // ★ v9: [BUTTON:배경|글자색|반경|텍스트|URL] → 색상 다양한 HTML 버튼
+            // 또는 구 형식 [BUTTON:텍스트|URL] 도 호환
+            if (preg_match('/^\[BUTTON:\s*(.+)\]$/', $t, $bm)) {
                 $flush();
-                $btnText = trim($bm[1]);
-                $btnUrl = trim($bm[2]);
-                $blocks[] = "<div style=\"text-align:center;margin:28px 0\"><a href=\"{$btnUrl}\" target=\"_blank\" rel=\"noopener\" style=\"display:inline-block;padding:14px 32px;background:#4a6cf7;color:#fff;text-decoration:none;border-radius:8px;font-size:15px;font-weight:600;box-shadow:0 2px 8px rgba(74,108,247,.3);transition:background .2s\">{$btnText}</a></div>";
+                $parts = explode('|', $bm[1]);
+                $parts = array_map('trim', $parts);
+                
+                if (count($parts) >= 5) {
+                    // 새 형식: [BUTTON:배경|글자색|반경|텍스트|URL]
+                    $bg = $parts[0];
+                    $color = $parts[1];
+                    $radius = $parts[2];
+                    $btnText = $parts[3];
+                    $btnUrl = $parts[4];
+                } elseif (count($parts) >= 2) {
+                    // 구 형식: [BUTTON:텍스트|URL]
+                    $btnText = $parts[0];
+                    $btnUrl = $parts[count($parts)-1];
+                    // 랜덤 색상 적용
+                    $btnColors = [
+                        ['#4a6cf7','#fff','30px'], ['#28a745','#fff','8px'], ['#17a2b8','#fff','12px'],
+                        ['#fd7e14','#fff','6px'], ['#6f42c1','#fff','25px'], ['#343a40','#fff','8px'],
+                        ['#e83e8c','#fff','10px'], ['#20c997','#fff','6px'], ['#dc3545','#fff','8px'],
+                        ['#ff6b35','#fff','10px'], ['#6c5ce7','#fff','25px'], ['#198754','#fff','30px'],
+                        ['#667eea','#fff','8px'], ['#f5576c','#fff','25px'], ['#00b894','#fff','8px'],
+                    ];
+                    $pick = $btnColors[array_rand($btnColors)];
+                    $bg = $pick[0]; $color = $pick[1]; $radius = $pick[2];
+                } else {
+                    $buffer[] = $t;
+                    continue;
+                }
+                
+                // URL 검증
+                if (!preg_match('/^https?:\/\//', $btnUrl)) {
+                    $buffer[] = $t;
+                    continue;
+                }
+                
+                $bgStyle = (strpos($bg, 'linear-gradient') !== false) ? "background:{$bg}" : "background-color:{$bg}";
+                $blocks[] = "<div style=\"text-align:center;margin:28px 0\"><a href=\"{$btnUrl}\" target=\"_blank\" rel=\"noopener\" style=\"display:inline-block;padding:14px 32px;{$bgStyle};color:{$color};text-decoration:none;border-radius:{$radius};font-size:15px;font-weight:600;box-shadow:0 2px 8px rgba(0,0,0,.15);transition:opacity .2s\">{$btnText}</a></div>";
                 continue;
             }
 

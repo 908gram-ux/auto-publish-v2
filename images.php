@@ -191,15 +191,13 @@ class StockImageSearch {
 
         $size = $type === 'thumbnail' ? '1200x630' : '800x400';
 
-        // ★ v3: 게시글 제목이 있으면 이미지 context에 추가
+        // ★ v5: 제목 context → 영문 검색어만 사용 (한글 제목 전달하면 AI가 텍스트를 이미지에 삽입해버림)
         $titleContext = '';
-        if (!empty($this->_currentTitle)) {
-            $titleContext = " The blog post title is: \"{$this->_currentTitle}\". Make the image relevant to this topic.";
-        }
+        // 한글 제목은 전달하지 않음 — 대신 영문 검색어(query)로 주제 전달
 
         // Imagen 모델은 다른 API 엔드포인트 사용
         if (str_starts_with($imageModel, 'imagen')) {
-            return $this->fromImagen($apiKey, $imageModel, $query, $type, $titleContext);
+            return $this->fromImagen($apiKey, $imageModel, $query, $type, '');
         }
 
         $url = "https://generativelanguage.googleapis.com/v1beta/models/{$imageModel}:generateContent?key={$apiKey}";
@@ -222,7 +220,7 @@ class StockImageSearch {
             CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_TIMEOUT => 60,
             CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
             CURLOPT_POSTFIELDS => json_encode([
-                'contents' => [['parts' => [['text' => "Create a realistic, photographic blog image about: {$query}.{$titleContext} Style: {$chosenStyle}. NO text, NO letters, NO words, NO watermarks in the image. Horizontal {$size} ratio. Ultra high quality, photorealistic."]]]],
+                'contents' => [['parts' => [['text' => "Create a photorealistic blog thumbnail image about: {$query}. Style: {$chosenStyle}. RULES: 1) Korean people only (Korean hairstyle, Korean fashion, Korean face). 2) Korean background setting (Seoul streets, Korean buildings, Korean cafe, Korean office, Korean school). 3) ABSOLUTELY NO text, NO letters, NO words, NO numbers, NO characters, NO watermarks anywhere in the image. Pure visual content only. 4) Must be 16:9 wide horizontal aspect ratio. 5) NOT illustration, NOT cartoon, NOT anime, NOT flat design. Must be photorealistic cinema quality. 6) Dramatic cinematic lighting, vivid saturated colors."]]]],
                 'generationConfig' => ['responseModalities' => ['IMAGE', 'TEXT'], 'maxOutputTokens' => 2048],
             ]),
         ]);
@@ -250,6 +248,7 @@ class StockImageSearch {
         return null;
     }
 
+
     /**
      * Google Imagen 이미지 생성
      */
@@ -266,7 +265,7 @@ class StockImageSearch {
             'fine art photography, golden hour, DSLR quality',
         ];
         $chosenStyle = $styles[array_rand($styles)];
-        $prompt = "A {$chosenStyle} blog image about: {$query}.{$titleContext} NO text, NO letters, NO watermarks. Photorealistic, high quality, professional.";
+        $prompt = "A {$chosenStyle} blog image about: {$query}. CRITICAL: ABSOLUTELY NO text, NO letters, NO words, NO numbers, NO characters, NO watermarks anywhere. Pure visual content only. Photorealistic, high quality, professional.";
 
         $ch = curl_init($url);
         curl_setopt_array($ch, [
@@ -316,7 +315,7 @@ class StockImageSearch {
             'digital art with gradients', 'retro vintage poster', 'paper cut-out layers',
         ];
         $chosenStyle = $styles[array_rand($styles)];
-        $prompt = "A {$chosenStyle} blog header image about: {$query}. NO text, NO letters, NO people, NO faces, NO hands. Only visual elements and objects. High quality, professional.";
+        $prompt = "A {$chosenStyle} blog header image about: {$query}. CRITICAL: ABSOLUTELY NO text, NO letters, NO words, NO numbers, NO watermarks anywhere. Pure visual content only. High quality, professional.";
 
         $body = ['model' => $dalleModel, 'prompt' => $prompt, 'n' => 1, 'size' => $size, 'response_format' => 'b64_json'];
         if ($dalleModel === 'dall-e-3') $body['quality'] = 'standard';
@@ -397,6 +396,7 @@ class StockImageSearch {
 
 class ImageGenerator {
     private $stock;
+    private $_thumbnailPrompt = '';
     // 색감 타입별 팔레트 (pick.brain177.com 참고)
     private $colorThemes = [
         'pastel' => [ // 🌸 파스텔
@@ -652,36 +652,30 @@ class ImageGenerator {
     }
 
     /**
-     * 썸네일: AI 배경 이미지 생성 + PHP GD 제목 텍스트 오버레이 (v4)
-     * 1차: AI로 배경 이미지 생성 → 텍스트 오버레이
-     * 2차: 스톡 이미지 검색 → 텍스트 오버레이
+     * 썸네일: AI 이미지 또는 스톡 이미지 (v5)
+     * 1차: AI 이미지 생성 (선택된 모델 사용)
+     * 2차: 스톡 이미지 폴백
      * 3차: 그라데이션 폴백
      */
-    public function createThumbnail($title, $keyword = '') {
+    public function createThumbnail($title, $keyword = '', $thumbnailPrompt = '') {
         $query = $keyword ?: $this->korToSearchTerm($title);
         $this->_currentTitle = $title;
+        $this->_thumbnailPrompt = '';  // 썸네일 프롬프트 사용 안 함
         
-        // 1차: AI 이미지로 배경 생성 시도
-        $bgPath = null;
+        // 1차: AI 이미지 생성
         $apiKey = getKey('gemini.api_key');
         $imageModel = getKey('gemini.image_model', '');
         if ($apiKey && $imageModel) {
-            $bgPath = $this->fromGemini($query, 'thumbnail');
+            $path = $this->fromGemini($query, 'thumbnail');
+            if ($path) return $path;
         }
         
         // 2차: 스톡 이미지 폴백
-        if (!$bgPath) {
-            $bgPath = $this->stock->search($query, 'thumbnail');
-        }
-        
-        // 배경 이미지가 있으면 텍스트 오버레이
-        if ($bgPath && file_exists($bgPath)) {
-            $overlaid = $this->overlayTextOnImage($bgPath, $title);
-            if ($overlaid) return $overlaid;
-        }
+        $stockPath = $this->stock->search($query, 'thumbnail');
+        if ($stockPath) return $stockPath;
         
         // 3차: 그라데이션 폴백
-        write_log("배경 이미지 없음 → 그라데이션 썸네일");
+        write_log("이미지 생성 실패 → 그라데이션 썸네일");
         $w=1200; $h=630;
         $pal = $this->getRandomPalette();
         $img = imagecreatetruecolor($w, $h);
@@ -691,101 +685,6 @@ class ImageGenerator {
         $this->drawOverlay($img, $w, $h);
         $this->text($img, $title, $w, $h, imagecolorallocate($img, 255, 255, 255), 28);
         return $this->saveGradient($img, 'thumb');
-    }
-
-    /**
-     * 배경 이미지 위에 제목 텍스트 오버레이 (뉴스 썸네일 스타일)
-     */
-    private function overlayTextOnImage($bgPath, $title) {
-        $w = 1200; $h = 630;
-        
-        // 배경 이미지 로드
-        $ext = strtolower(pathinfo($bgPath, PATHINFO_EXTENSION));
-        switch ($ext) {
-            case 'jpg': case 'jpeg': $bg = @imagecreatefromjpeg($bgPath); break;
-            case 'png': $bg = @imagecreatefrompng($bgPath); break;
-            case 'webp': $bg = function_exists('imagecreatefromwebp') ? @imagecreatefromwebp($bgPath) : null; break;
-            default: $bg = null;
-        }
-        if (!$bg) return null;
-        
-        // 1200x630으로 리사이즈
-        $srcW = imagesx($bg); $srcH = imagesy($bg);
-        $canvas = imagecreatetruecolor($w, $h);
-        imagecopyresampled($canvas, $bg, 0, 0, 0, 0, $w, $h, $srcW, $srcH);
-        imagedestroy($bg);
-        
-        // 하단 그라데이션 오버레이 (텍스트 가독성)
-        for ($y = (int)($h * 0.35); $y < $h; $y++) {
-            $alpha = (int)(($y - $h * 0.35) / ($h * 0.65) * 100);
-            $alpha = min(100, $alpha);
-            $overlay = imagecolorallocatealpha($canvas, 0, 0, 0, 127 - (int)($alpha * 1.1));
-            imageline($canvas, 0, $y, $w, $y, $overlay);
-        }
-        
-        // 폰트 확인
-        $fontPath = defined('FONT_PATH') ? FONT_PATH : (__DIR__ . '/fonts/NanumGothicBold.ttf');
-        if (!file_exists($fontPath)) {
-            write_log("⚠️ 폰트 없음: {$fontPath}");
-            imagedestroy($canvas);
-            return null;
-        }
-        
-        // 제목 텍스트 줄바꿈 처리 (한 줄 최대 16자)
-        $maxCharsPerLine = 16;
-        $titleLines = [];
-        $remaining = $title;
-        while (mb_strlen($remaining) > 0) {
-            if (mb_strlen($remaining) <= $maxCharsPerLine) {
-                $titleLines[] = $remaining;
-                break;
-            }
-            $line = mb_substr($remaining, 0, $maxCharsPerLine);
-            // 단어 중간 끊김 방지 (공백/쉼표/마침표에서 끊기)
-            $lastSpace = mb_strrpos($line, ' ');
-            $lastComma = mb_strrpos($line, ',');
-            $breakPos = max($lastSpace ?: 0, $lastComma ?: 0);
-            if ($breakPos > $maxCharsPerLine * 0.4) {
-                $line = mb_substr($remaining, 0, $breakPos + 1);
-            }
-            $titleLines[] = trim($line);
-            $remaining = trim(mb_substr($remaining, mb_strlen($line)));
-        }
-        // 최대 3줄
-        $titleLines = array_slice($titleLines, 0, 3);
-        
-        // 텍스트 렌더링
-        $fontSize = 42;
-        $lineHeight = (int)($fontSize * 1.6);
-        $totalTextH = count($titleLines) * $lineHeight;
-        $startY = $h - $totalTextH - 40; // 하단에서 40px 위
-        
-        $white = imagecolorallocate($canvas, 255, 255, 255);
-        $shadow = imagecolorallocate($canvas, 0, 0, 0);
-        
-        foreach ($titleLines as $i => $line) {
-            $bbox = imagettfbbox($fontSize, 0, $fontPath, $line);
-            $textW = $bbox[2] - $bbox[0];
-            $x = 50; // 왼쪽 정렬, 50px 마진
-            $y = $startY + ($i * $lineHeight) + $fontSize;
-            
-            // 그림자
-            imagettftext($canvas, $fontSize, 0, $x + 2, $y + 2, $shadow, $fontPath, $line);
-            imagettftext($canvas, $fontSize, 0, $x + 1, $y + 1, $shadow, $fontPath, $line);
-            // 본문
-            imagettftext($canvas, $fontSize, 0, $x, $y, $white, $fontPath, $line);
-        }
-        
-        // 저장
-        $path = IMAGE_SAVE_DIR . 'thumb_overlay_' . time() . '_' . mt_rand(1000,9999) . '.jpg';
-        imagejpeg($canvas, $path, 92);
-        imagedestroy($canvas);
-        
-        // 원본 배경 이미지 삭제 (임시 파일)
-        @unlink($bgPath);
-        
-        write_log("🖼️ 썸네일 생성: AI 배경 + 텍스트 오버레이");
-        return $path;
     }
 
     private function createGradientSection($text) {
@@ -918,6 +817,155 @@ class ImageGenerator {
     }
 
     /**
+     * ★ v6: 네이버 수집 이미지 다운로드 + 변조
+     * @param string $url 이미지 URL
+     * @return string|null 로컬 저장 경로 (변조 완료)
+     */
+    public function downloadNaverImage($url) {
+        if (!$url || !filter_var($url, FILTER_VALIDATE_URL)) return null;
+
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 3,
+            CURLOPT_TIMEOUT => 20,
+            CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_HTTPHEADER => [
+                'Accept: image/webp,image/apng,image/*,*/*;q=0.8',
+                'Referer: https://search.naver.com/',
+            ],
+        ]);
+        $data = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $contentType = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+        curl_close($ch);
+
+        if ($code !== 200 || strlen($data) < 5000) {
+            write_log("⚠️ 네이버 이미지 다운로드 실패: HTTP {$code}, 크기: " . strlen($data) . " bytes");
+            return null;
+        }
+
+        // 이미지 유효성 확인
+        $tmpPath = (defined('IMAGE_SAVE_DIR') ? IMAGE_SAVE_DIR : (__DIR__ . '/tmp_images/'))
+                   . 'nv_raw_' . time() . '_' . mt_rand(1000, 9999);
+
+        // 확장자 판단
+        if (str_contains($contentType, 'webp')) $tmpPath .= '.webp';
+        elseif (str_contains($contentType, 'png')) $tmpPath .= '.png';
+        elseif (str_contains($contentType, 'gif')) $tmpPath .= '.gif';
+        else $tmpPath .= '.jpg';
+
+        $saveDir = dirname($tmpPath);
+        if (!is_dir($saveDir)) mkdir($saveDir, 0755, true);
+        file_put_contents($tmpPath, $data);
+
+        // GD로 열 수 있는지 확인
+        $info = @getimagesize($tmpPath);
+        if (!$info || $info[0] < 200 || $info[1] < 150) {
+            @unlink($tmpPath);
+            write_log("⚠️ 네이버 이미지 유효하지 않음 (크기: " . ($info[0] ?? 0) . "x" . ($info[1] ?? 0) . ")");
+            return null;
+        }
+
+        // 1단계: 리사이즈 + 압축 (ImageOptimizer::optimize)
+        $optimized = ImageOptimizer::optimize($tmpPath, 'content');
+        if ($optimized && $optimized !== $tmpPath) {
+            @unlink($tmpPath);
+            $tmpPath = $optimized;
+        }
+
+        // 2단계: 변조 (중복 감지 회피)
+        $disguised = ImageOptimizer::disguise($tmpPath);
+        if ($disguised && $disguised !== $tmpPath) {
+            @unlink($tmpPath);
+            return $disguised;
+        }
+
+        return $tmpPath;
+    }
+
+    /**
+     * ★ v6: 네이버 수집 이미지로 본문 이미지 처리
+     * search.php의 searchNaverImages()가 반환한 이미지 URL을 다운로드 + 변조 후 본문에 삽입
+     *
+     * @param string $html 본문 HTML ([IMAGE:...] 태그 포함)
+     * @param array $naverImages searchNaverImages() 반환값 [['url'=>..., 'source'=>..., 'title'=>...], ...]
+     * @param string $keyword 키워드 (alt 텍스트 폴백용)
+     * @param int $imageCount 최대 삽입할 이미지 수
+     * @return array ['content'=>수정된HTML, 'images'=>로컬파일경로배열]
+     */
+    public function processNaverImages($html, $naverImages, $keyword = '', $imageCount = 3) {
+        // 1단계: 이미지 다운로드 + 변조
+        $localImages = [];
+        $tried = 0;
+        foreach ($naverImages as $imgData) {
+            if (count($localImages) >= $imageCount + 1) break; // 여유분 1개
+            if ($tried >= $imageCount * 2) break; // 무한 시도 방지
+            $tried++;
+
+            $url = is_array($imgData) ? ($imgData['url'] ?? '') : $imgData;
+            if (!$url) continue;
+
+            $localPath = $this->downloadNaverImage($url);
+            if ($localPath) {
+                $localImages[] = $localPath;
+                write_log("🖼️ 네이버 이미지 준비 완료: " . basename($localPath) . " ← " . substr($url, 0, 80));
+            }
+            usleep(500000); // 다운로드 간 0.5초 대기
+        }
+
+        if (empty($localImages)) {
+            write_log("⚠️ 네이버 이미지 수집 실패 → [IMAGE] 태그 제거, 그라데이션 폴백");
+            // 폴백: 기존 processImages 로직 사용
+            return $this->processImages($html);
+        }
+
+        write_log("🖼️ 네이버 이미지 " . count($localImages) . "개 다운로드+변조 완료");
+
+        $paths = [];
+        $usedIdx = 0;
+
+        // 2단계: [IMAGE:...] 태그를 네이버 이미지로 교체
+        $html = preg_replace_callback('/\[IMAGE:\s*(.+?)\]/', function($m) use (&$paths, &$usedIdx, $localImages) {
+            if ($usedIdx >= count($localImages)) return ''; // 이미지 부족하면 제거
+            $p = $localImages[$usedIdx++];
+            $altText = trim(explode('|', $m[1])[0]);
+            $paths[] = $p;
+            write_log("🖼️ 네이버 이미지 삽입: " . basename($p) . " (alt: {$altText})");
+            return "<!-- wp:image {\"align\":\"center\",\"sizeSlug\":\"large\"} -->\n<figure class=\"wp-block-image aligncenter size-large\" style=\"max-width:1080px;margin:12px auto;\"><img src=\"{$p}\" alt=\"" . htmlspecialchars($altText) . "\" style=\"width:100%;height:auto;display:block;\"/></figure>\n<!-- /wp:image -->";
+        }, $html);
+
+        // 3단계: 이미지가 남아있고 [IMAGE] 태그보다 이미지가 많으면 H2 사이에 자동 삽입
+        $remaining = min($imageCount - $usedIdx, count($localImages) - $usedIdx);
+        if ($remaining > 0) {
+            preg_match_all('/(<h2[^>]*>|<!-- wp:heading )/', $html, $matches, PREG_OFFSET_CAPTURE);
+            $h2Positions = array_column($matches[0], 1);
+
+            if (count($h2Positions) > 1) {
+                $insertPoints = [];
+                $step = max(1, floor(count($h2Positions) / ($remaining + 1)));
+                for ($i = 0; $i < $remaining && ($step * ($i + 1)) < count($h2Positions); $i++) {
+                    $insertPoints[] = $h2Positions[$step * ($i + 1)];
+                }
+                rsort($insertPoints); // 역순 삽입 (offset 밀림 방지)
+                foreach ($insertPoints as $pos) {
+                    if ($usedIdx >= count($localImages)) break;
+                    $p = $localImages[$usedIdx++];
+                    $paths[] = $p;
+                    $imgHtml = "\n<!-- wp:image {\"align\":\"center\",\"sizeSlug\":\"large\"} -->\n<figure class=\"wp-block-image aligncenter size-large\" style=\"max-width:1080px;margin:12px auto;\"><img src=\"{$p}\" alt=\"" . htmlspecialchars($keyword) . "\" style=\"width:100%;height:auto;display:block;\"/></figure>\n<!-- /wp:image -->\n";
+                    $html = substr($html, 0, $pos) . $imgHtml . substr($html, $pos);
+                    write_log("🖼️ 네이버 이미지 자동 삽입(H2 사이): " . basename($p));
+                }
+            }
+        }
+
+        write_log("🖼️ 네이버 이미지 총 " . count($paths) . "개 본문 삽입 완료");
+        return ['content' => $html, 'images' => $paths];
+    }
+
+    /**
      * 로컬 이미지에서 썸네일용 이미지 선택
      */
     public function getLocalThumbnail($keyword = '') {
@@ -1022,6 +1070,121 @@ class ImageGenerator {
  * 이미지 최적화 유틸리티
  */
 class ImageOptimizer {
+
+    /**
+     * ★ v6: 이미지 변조 — 중복 이미지 감지 회피
+     * GD로 원본에 랜덤 변형을 적용하여 해시값을 완전히 변경
+     * @param string $srcPath 원본 이미지 경로
+     * @return string|null 변조된 이미지 경로
+     */
+    public static function disguise($srcPath) {
+        if (!file_exists($srcPath)) return null;
+
+        $info = @getimagesize($srcPath);
+        if (!$info) return null;
+
+        $origW = $info[0]; $origH = $info[1];
+        if ($origW < 100 || $origH < 100) return null;
+
+        // 이미지 로드
+        switch ($info[2]) {
+            case IMAGETYPE_JPEG: $src = @imagecreatefromjpeg($srcPath); break;
+            case IMAGETYPE_PNG:  $src = @imagecreatefrompng($srcPath); break;
+            case IMAGETYPE_GIF:  $src = @imagecreatefromgif($srcPath); break;
+            case IMAGETYPE_WEBP: $src = @imagecreatefromwebp($srcPath); break;
+            default: return $srcPath;
+        }
+        if (!$src) return $srcPath;
+
+        // ── 변조 1: 랜덤 크롭 (2~5%) ──
+        $cropPct = mt_rand(2, 5) / 100;
+        $cropL = (int)($origW * $cropPct * (mt_rand(30, 70) / 100));
+        $cropR = (int)($origW * $cropPct) - $cropL;
+        $cropT = (int)($origH * $cropPct * (mt_rand(30, 70) / 100));
+        $cropB = (int)($origH * $cropPct) - $cropT;
+        $newW = $origW - $cropL - $cropR;
+        $newH = $origH - $cropT - $cropB;
+
+        $cropped = imagecreatetruecolor($newW, $newH);
+        imagealphablending($cropped, false);
+        imagesavealpha($cropped, true);
+        imagecopyresampled($cropped, $src, 0, 0, $cropL, $cropT, $newW, $newH, $newW, $newH);
+        imagedestroy($src);
+        $src = $cropped;
+
+        // ── 변조 2: 밝기 미세 조정 (±5~12) ──
+        $brightness = mt_rand(-12, 12);
+        if (abs($brightness) < 5) $brightness = ($brightness >= 0 ? 5 : -5);
+        imagefilter($src, IMG_FILTER_BRIGHTNESS, $brightness);
+
+        // ── 변조 3: 대비 미세 조정 (±3~8) ──
+        $contrast = mt_rand(-8, 8);
+        if (abs($contrast) < 3) $contrast = ($contrast >= 0 ? 3 : -3);
+        imagefilter($src, IMG_FILTER_CONTRAST, $contrast);
+
+        // ── 변조 4: 얇은 테두리 추가 (랜덤 색상, 1~3px) ──
+        $borderW = mt_rand(1, 3);
+        $borderStyles = ['white', 'light_gray', 'soft_shadow', 'subtle_color'];
+        $borderStyle = $borderStyles[array_rand($borderStyles)];
+
+        $bW = imagesx($src); $bH = imagesy($src);
+        switch ($borderStyle) {
+            case 'white':
+                $bc = imagecolorallocate($src, 255, 255, 255);
+                break;
+            case 'light_gray':
+                $g = mt_rand(220, 245);
+                $bc = imagecolorallocate($src, $g, $g, $g);
+                break;
+            case 'soft_shadow':
+                $bc = imagecolorallocate($src, mt_rand(180, 210), mt_rand(180, 210), mt_rand(180, 210));
+                break;
+            case 'subtle_color':
+                $bc = imagecolorallocate($src, mt_rand(200, 240), mt_rand(200, 240), mt_rand(210, 245));
+                break;
+            default:
+                $bc = imagecolorallocate($src, 240, 240, 240);
+        }
+        // 상하좌우 테두리 그리기
+        for ($i = 0; $i < $borderW; $i++) {
+            imagerectangle($src, $i, $i, $bW - 1 - $i, $bH - 1 - $i, $bc);
+        }
+
+        // ── 변조 5: 랜덤으로 추가 효과 (50% 확률) ──
+        $extraEffect = mt_rand(0, 3);
+        switch ($extraEffect) {
+            case 0: // 약간의 가우시안 블러 (매우 미세)
+                if (function_exists('imagefilter')) {
+                    imagefilter($src, IMG_FILTER_SMOOTH, mt_rand(6, 10));
+                }
+                break;
+            case 1: // 채도 미세 변경 (colorize)
+                imagefilter($src, IMG_FILTER_COLORIZE, mt_rand(-5, 5), mt_rand(-5, 5), mt_rand(-5, 5));
+                break;
+            // case 2,3: 추가 효과 없음 (원본에 가깝게)
+        }
+
+        // ── 저장: 랜덤 품질로 재인코딩 ──
+        $saveDir = defined('IMAGE_SAVE_DIR') ? IMAGE_SAVE_DIR : (__DIR__ . '/tmp_images/');
+        if (!is_dir($saveDir)) mkdir($saveDir, 0755, true);
+        $basename = 'nv_' . time() . '_' . mt_rand(1000, 9999);
+
+        $quality = mt_rand(65, 78); // 랜덤 품질 → 파일 해시 변경
+        if (function_exists('imagewebp')) {
+            $outPath = $saveDir . $basename . '.webp';
+            imagewebp($src, $outPath, $quality);
+        } else {
+            $outPath = $saveDir . $basename . '.jpg';
+            imagejpeg($src, $outPath, $quality);
+        }
+        imagedestroy($src);
+
+        $origSize = filesize($srcPath);
+        $newSize = filesize($outPath);
+        write_log("🎭 이미지 변조: " . basename($srcPath) . " → " . basename($outPath) . " (" . round($newSize/1024) . "KB, 밝기:{$brightness} 대비:{$contrast} 테두리:{$borderW}px)");
+
+        return $outPath;
+    }
 
     /**
      * 이미지 최적화: 리사이즈 + 압축 + WebP 변환

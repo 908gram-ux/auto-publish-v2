@@ -133,6 +133,210 @@ class WebSearcher {
         return !empty($this->searchNaver("테스트"));
     }
 
+    /**
+     * ★ v6: 네이버 이미지 수집 (뉴스 제외)
+     * 네이버 이미지 검색 API + 크롤링 페이지에서 이미지 URL 수집
+     * @param string $keyword 검색어
+     * @param int $count 수집할 이미지 수 (2~5)
+     * @return array ['url'=>이미지URL, 'source'=>출처] 배열
+     */
+    public function searchNaverImages($keyword, $count = 5) {
+        $clientId = getKey('naver.client_id');
+        $clientSecret = getKey('naver.client_secret');
+        if (!$clientId || !$clientSecret) {
+            write_log("⚠️ 네이버 API 키 없음 → 이미지 수집 불가");
+            return [];
+        }
+
+        $collected = [];
+
+        // ── 1차: 네이버 이미지 검색 API ──
+        $url = "https://openapi.naver.com/v1/search/image?" . http_build_query([
+            'query' => $keyword,
+            'display' => min(20, $count * 4), // 필터링 후 충분한 수 확보
+            'sort' => 'sim',
+            'filter' => 'large',
+        ]);
+
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 15,
+            CURLOPT_HTTPHEADER => [
+                'X-Naver-Client-Id: ' . $clientId,
+                'X-Naver-Client-Secret: ' . $clientSecret,
+            ],
+        ]);
+        $resp = curl_exec($ch); curl_close($ch);
+        $data = json_decode($resp, true);
+
+        // 뉴스 도메인 필터 목록
+        $newsDomains = [
+            'news.naver.com','n.news.naver.com','news.joins.com','news.chosun.com',
+            'news.donga.com','news.hankyung.com','news.mt.co.kr','news.sbs.co.kr',
+            'news.kbs.co.kr','news.mbc.co.kr','news.jtbc.co.kr','newsis.com',
+            'yonhapnews.co.kr','yna.co.kr','edaily.co.kr','mk.co.kr','sedaily.com',
+            'hani.co.kr','khan.co.kr','ohmynews.com','nocutnews.co.kr',
+            'imgnews.naver.net','mimgnews.naver.net', // 네이버 뉴스 이미지 CDN
+        ];
+
+        if (!empty($data['items'])) {
+            foreach ($data['items'] as $item) {
+                $imgUrl = $item['link'] ?? '';
+                $sourceUrl = $item['sizeheight'] ?? ''; // 출처 페이지
+                if (!$imgUrl) continue;
+
+                // ★ 뉴스 도메인 필터링
+                $isNews = false;
+                foreach ($newsDomains as $nd) {
+                    if (stripos($imgUrl, $nd) !== false) { $isNews = true; break; }
+                }
+                if ($isNews) continue;
+
+                // 너무 작은 이미지 제외 (썸네일 등)
+                $w = intval($item['sizewidth'] ?? 0);
+                $h = intval($item['sizeheight'] ?? 0);
+                if ($w > 0 && $w < 300) continue;
+                if ($h > 0 && $h < 200) continue;
+
+                $collected[] = [
+                    'url' => $imgUrl,
+                    'source' => 'naver_image_api',
+                    'title' => html_entity_decode(strip_tags($item['title'] ?? ''), ENT_QUOTES, 'UTF-8'),
+                ];
+
+                if (count($collected) >= $count) break;
+            }
+        }
+
+        // ── 2차: 부족하면 블로그/웹 크롤링 페이지에서 이미지 추출 ──
+        if (count($collected) < $count) {
+            $extraNeeded = $count - count($collected);
+            $crawlImages = $this->extractImagesFromSearch($keyword, $extraNeeded, $newsDomains);
+            $collected = array_merge($collected, $crawlImages);
+        }
+
+        $collected = array_slice($collected, 0, $count);
+        write_log("🖼️ 네이버 이미지 수집: {$keyword} → " . count($collected) . "개 (뉴스 제외)");
+        return $collected;
+    }
+
+    /**
+     * ★ v6: 블로그/웹 검색 결과 페이지에서 이미지 URL 추출 (뉴스 제외)
+     */
+    private function extractImagesFromSearch($keyword, $needed, $newsDomains) {
+        $clientId = getKey('naver.client_id');
+        $clientSecret = getKey('naver.client_secret');
+        if (!$clientId || !$clientSecret) return [];
+
+        $collected = [];
+
+        // 블로그 검색 결과에서 이미지 추출 (뉴스는 건너뜀)
+        foreach (['blog.json' => 5, 'webkr.json' => 3] as $ep => $cnt) {
+            if (count($collected) >= $needed) break;
+
+            $url = "https://openapi.naver.com/v1/search/{$ep}?" . http_build_query([
+                'query' => $keyword, 'display' => $cnt, 'sort' => 'sim',
+            ]);
+            $ch = curl_init($url);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 15,
+                CURLOPT_HTTPHEADER => [
+                    'X-Naver-Client-Id: ' . $clientId,
+                    'X-Naver-Client-Secret: ' . $clientSecret,
+                ],
+            ]);
+            $resp = curl_exec($ch); curl_close($ch);
+            $data = json_decode($resp, true);
+
+            foreach ($data['items'] ?? [] as $item) {
+                if (count($collected) >= $needed) break;
+                $pageUrl = $item['link'] ?? $item['originallink'] ?? '';
+                if (!$pageUrl) continue;
+
+                // 뉴스 도메인 건너뛰기
+                $isNews = false;
+                foreach ($newsDomains as $nd) {
+                    if (stripos($pageUrl, $nd) !== false) { $isNews = true; break; }
+                }
+                if ($isNews) continue;
+
+                // 페이지에서 이미지 추출
+                $imgs = $this->scrapeImagesFromPage($pageUrl);
+                foreach ($imgs as $imgUrl) {
+                    if (count($collected) >= $needed) break;
+                    // 중복 URL 체크
+                    $isDup = false;
+                    foreach ($collected as $c) {
+                        if ($c['url'] === $imgUrl) { $isDup = true; break; }
+                    }
+                    if (!$isDup) {
+                        $collected[] = ['url' => $imgUrl, 'source' => 'naver_crawl', 'title' => ''];
+                    }
+                }
+                usleep(300000); // 크롤링 간 0.3초 대기
+            }
+        }
+
+        return $collected;
+    }
+
+    /**
+     * ★ v6: 개별 페이지에서 이미지 URL 스크래핑
+     */
+    private function scrapeImagesFromPage($url) {
+        if (!$url || !filter_var($url, FILTER_VALIDATE_URL)) return [];
+
+        // 네이버 블로그는 모바일 버전이 크롤링 용이
+        if (strpos($url, 'blog.naver.com') !== false) {
+            $url = str_replace('blog.naver.com', 'm.blog.naver.com', $url);
+        }
+
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 8,
+            CURLOPT_FOLLOWLOCATION => true, CURLOPT_MAXREDIRS => 3,
+            CURLOPT_USERAGENT => 'Mozilla/5.0 (compatible; Googlebot/2.1)',
+            CURLOPT_SSL_VERIFYPEER => false,
+        ]);
+        $html = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($code !== 200 || !$html) return [];
+
+        $images = [];
+
+        // <img> 태그에서 src 추출
+        preg_match_all('/<img[^>]+src=["\']([^"\']+)["\'][^>]*/i', $html, $matches);
+        foreach ($matches[1] ?? [] as $imgSrc) {
+            // 상대 URL → 절대 URL
+            if (strpos($imgSrc, '//') === 0) $imgSrc = 'https:' . $imgSrc;
+            elseif (strpos($imgSrc, '/') === 0) {
+                $parsed = parse_url($url);
+                $imgSrc = ($parsed['scheme'] ?? 'https') . '://' . ($parsed['host'] ?? '') . $imgSrc;
+            }
+
+            // 필터: 유효한 이미지 URL만
+            if (!preg_match('/\.(jpg|jpeg|png|webp|gif)/i', $imgSrc)) continue;
+            // 아이콘/로고/버튼 등 제외
+            if (preg_match('/(icon|logo|button|banner|ad|sprite|emoji|avatar|profile|thumb_s)/i', $imgSrc)) continue;
+            // 너무 작은 이미지 파라미터 감지
+            if (preg_match('/[?&](w|width)=(\d+)/i', $imgSrc, $wm) && intval($wm[2]) < 200) continue;
+            // data: URL 제외
+            if (strpos($imgSrc, 'data:') === 0) continue;
+
+            // 네이버 블로그 이미지: 고화질 버전으로 변환
+            if (strpos($imgSrc, 'blogpfx.naver.net') !== false || strpos($imgSrc, 'postfiles.naver.net') !== false) {
+                $imgSrc = preg_replace('/\?type=.*$/', '?type=w966', $imgSrc);
+            }
+
+            $images[] = $imgSrc;
+            if (count($images) >= 3) break; // 페이지당 최대 3개
+        }
+
+        return $images;
+    }
+
     /** Naver 테스트 결과 반환 */
     public function testDetailed() {
         $results = [];

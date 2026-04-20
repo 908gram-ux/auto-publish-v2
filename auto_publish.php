@@ -406,6 +406,14 @@ if (isset($opts['job'])) {
             ghProgress($jobId, "[1/7] Naver 검색: {$kw}");
             $ndata = $searcher->searchAll($kw); sleep(1);
 
+            // ★ v6: 네이버 이미지 수집 (이미지 소스가 naver일 때)
+            $naverImages = [];
+            if ($postImgSrc === 'naver') {
+                write_log("[1.5/7] 네이버 이미지 수집 (뉴스 제외, 최대 {$postImgCnt}개)");
+                ghProgress($jobId, "[1.5/7] 네이버 이미지 수집 중...");
+                $naverImages = $searcher->searchNaverImages($kw, max(3, $postImgCnt + 2));
+            }
+
             // 2. AI 글 생성 (행별 설정 적용)
             write_log("[2/7] AI 글 생성 (AI:{$postAiMode} 이미지:{$postImgSrc} ×{$postImgCnt} 글자:{$contentMin}~{$contentMax})");
             ghProgress($jobId, "[2/7] AI 글 생성 중... (AI:{$postAiMode}, 글자:{$contentMin}~{$contentMax})");
@@ -473,6 +481,32 @@ if (isset($opts['job'])) {
 
                 write_log("[4/7] 로컬 이미지 본문 삽입");
                 $proc = $image->processLocalImages($post['content_html'], $kw, $postImgCnt);
+                $post['content_html'] = $proc['content'] ?? $post['content_html'];
+                $imgs = $proc['images'] ?? [];
+                goto skipImages;
+            }
+
+            // ★ v6: 이미지 '네이버 수집' 처리
+            if ($postImgSrc === 'naver') {
+                write_log("[3/7] 네이버 수집 이미지 썸네일");
+                // 썸네일: 네이버 수집 이미지 중 첫 번째 사용, 없으면 그라데이션
+                $thumb = null;
+                if (!empty($naverImages)) {
+                    $thumbUrl = is_array($naverImages[0]) ? ($naverImages[0]['url'] ?? '') : $naverImages[0];
+                    if ($thumbUrl) {
+                        $thumb = $image->downloadNaverImage($thumbUrl);
+                    }
+                }
+                if (!$thumb) {
+                    write_log("⚠️ 네이버 썸네일 실패 → 그라데이션 생성");
+                    $thumb = $image->createThumbnail($post['title'], $kw);
+                }
+
+                write_log("[4/7] 네이버 수집 이미지 본문 삽입 (최대 {$postImgCnt}개)");
+                ghProgress($jobId, "[4/7] 네이버 이미지 변조+삽입 중...");
+                // 썸네일에 사용한 첫 번째 이미지는 본문용에서 제외
+                $bodyNaverImages = array_slice($naverImages, 1);
+                $proc = $image->processNaverImages($post['content_html'], $bodyNaverImages, $kw, $postImgCnt);
                 $post['content_html'] = $proc['content'] ?? $post['content_html'];
                 $imgs = $proc['images'] ?? [];
                 goto skipImages;
@@ -766,7 +800,7 @@ foreach ($sites as $siteIdx => $site) {
             // CLI --img 옵션으로 이미지 소스 오버라이드
             $cliImg = $opts['img'] ?? '';
             $origPriority = null;
-            if ($cliImg && in_array($cliImg, ['pixabay','pexels','gemini','dalle','gradient','none','local'])) {
+            if ($cliImg && in_array($cliImg, ['pixabay','pexels','gemini','dalle','gradient','none','local','naver'])) {
                 if ($cliImg === 'none') {
                     write_log("[3/7] 이미지 사용안함 → 건너뜀");
                     $thumb = null; $imgs = []; $content = preg_replace('/\[IMAGE:[^\]]*\]/', '', $post['content_html']);
@@ -777,6 +811,22 @@ foreach ($sites as $siteIdx => $site) {
                     if (!$thumb) $thumb = $image->createThumbnail($post['title'], $kw);
                     write_log("[4/7] 로컬 이미지 본문 삽입");
                     $proc = $image->processLocalImages($post['content_html'], $kw, 3);
+                    $content = $proc['content']; $imgs = $proc['images'];
+                    goto skipImagesCli;
+                }
+                // ★ v6: CLI --img=naver 네이버 수집
+                if ($cliImg === 'naver') {
+                    write_log("[3/7] 네이버 이미지 수집 (뉴스 제외)");
+                    $naverImgs = $searcher->searchNaverImages($kw, 5);
+                    $thumb = null;
+                    if (!empty($naverImgs)) {
+                        $thumbUrl = is_array($naverImgs[0]) ? ($naverImgs[0]['url'] ?? '') : $naverImgs[0];
+                        if ($thumbUrl) $thumb = $image->downloadNaverImage($thumbUrl);
+                    }
+                    if (!$thumb) $thumb = $image->createThumbnail($post['title'], $kw);
+                    write_log("[4/7] 네이버 이미지 본문 삽입");
+                    $bodyNaverImgs = array_slice($naverImgs, 1);
+                    $proc = $image->processNaverImages($post['content_html'], $bodyNaverImgs, $kw, 3);
                     $content = $proc['content']; $imgs = $proc['images'];
                     goto skipImagesCli;
                 }

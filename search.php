@@ -149,19 +149,125 @@ class WebSearcher {
         }
 
         $collected = [];
-
-        // ★ v7: 현재 연도를 검색어에 추가하여 최신 이미지 우선 확보
         $currentYear = date('Y');
-        $searchKeyword = $keyword . ' ' . $currentYear;
 
-        // ── 1차: 네이버 이미지 검색 API (연도 포함 검색) ──
-        $url = "https://openapi.naver.com/v1/search/image?" . http_build_query([
-            'query' => $searchKeyword,
-            'display' => min(30, $count * 5), // 필터링 후 충분한 수 확보 (더 넉넉하게)
-            'sort' => 'date', // ★ v7: 최신순 정렬 (sim→date)
-            'filter' => 'large',
+        // 뉴스 도메인 필터 목록
+        $newsDomains = [
+            'news.naver.com','n.news.naver.com','news.joins.com','news.chosun.com',
+            'news.donga.com','news.hankyung.com','news.mt.co.kr','news.sbs.co.kr',
+            'news.kbs.co.kr','news.mbc.co.kr','news.jtbc.co.kr','newsis.com',
+            'yonhapnews.co.kr','yna.co.kr','edaily.co.kr','mk.co.kr','sedaily.com',
+            'hani.co.kr','khan.co.kr','ohmynews.com','nocutnews.co.kr',
+            'imgnews.naver.net','mimgnews.naver.net',
+        ];
+
+        // ★ v7: 뉴스 제목 키워드 (이런 단어가 제목에 있으면 뉴스 이미지로 판단)
+        $newsTitleKeywords = ['뉴스', '속보', '기사', '보도', '취재', '기자', '언론', '신문', 
+            '방송', 'MBC', 'KBS', 'SBS', 'JTBC', 'YTN', '연합뉴스', '한겨레', '조선일보', 
+            '중앙일보', '동아일보', '매일경제', '한국경제'];
+
+        // ★ v7: 블로그 이미지 CDN 도메인 (이 도메인의 이미지만 허용)
+        $blogImageDomains = [
+            'blogpfx.naver.net', 'postfiles.naver.net', 'mblogthumb-phinf.pstatic.net',
+            'blog.kakaocdn.net', 'img1.daumcdn.net', 'k.kakaocdn.net',
+            't1.daumcdn.net', 'blog.naver.com', 'm.blog.naver.com',
+            'phinf.pstatic.net', 'storep-phinf.pstatic.net',
+        ];
+
+        // ═══ 1차: 네이버 블로그 검색 → 블로그 글에서 이미지 직접 추출 ═══
+        // (이미지 검색 API 대신 블로그 검색을 먼저 — 블로그 이미지가 주제와 훨씬 맞음)
+        write_log("🖼️ 네이버 블로그에서 이미지 수집 중: {$keyword}");
+        $blogImages = $this->extractBlogImages($keyword, $count + 2, $newsDomains, $newsTitleKeywords);
+        $collected = array_merge($collected, $blogImages);
+
+        // ═══ 2차: 부족하면 이미지 검색 API (블로그 CDN 이미지만 필터) ═══
+        if (count($collected) < $count) {
+            $needed = $count - count($collected);
+            write_log("🖼️ 블로그 이미지 부족({$needed}개 더 필요) → 이미지 API 보충");
+
+            $url = "https://openapi.naver.com/v1/search/image?" . http_build_query([
+                'query' => $keyword . ' ' . $currentYear,
+                'display' => min(30, $needed * 6),
+                'sort' => 'date',
+                'filter' => 'large',
+            ]);
+            $ch = curl_init($url);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 15,
+                CURLOPT_HTTPHEADER => [
+                    'X-Naver-Client-Id: ' . $clientId,
+                    'X-Naver-Client-Secret: ' . $clientSecret,
+                ],
+            ]);
+            $resp = curl_exec($ch); curl_close($ch);
+            $data = json_decode($resp, true);
+
+            foreach ($data['items'] ?? [] as $item) {
+                if (count($collected) >= $count) break;
+                $imgUrl = $item['link'] ?? '';
+                if (!$imgUrl) continue;
+
+                // ★ 블로그 CDN 이미지만 허용
+                $isBlogImg = false;
+                foreach ($blogImageDomains as $bd) {
+                    if (stripos($imgUrl, $bd) !== false) { $isBlogImg = true; break; }
+                }
+                if (!$isBlogImg) continue;
+
+                // 뉴스 제목 필터
+                $title = strip_tags($item['title'] ?? '');
+                $isNewsy = false;
+                foreach ($newsTitleKeywords as $nk) {
+                    if (mb_stripos($title, $nk) !== false) { $isNewsy = true; break; }
+                }
+                if ($isNewsy) continue;
+
+                // 크기 필터
+                $w = intval($item['sizewidth'] ?? 0);
+                $h = intval($item['sizeheight'] ?? 0);
+                if ($w > 0 && $w < 300) continue;
+                if ($h > 0 && $h < 200) continue;
+
+                // 중복 URL 체크
+                $isDup = false;
+                foreach ($collected as $c) {
+                    if ($c['url'] === $imgUrl) { $isDup = true; break; }
+                }
+                if ($isDup) continue;
+
+                $collected[] = [
+                    'url' => $imgUrl,
+                    'source' => 'naver_image_api_blog',
+                    'title' => html_entity_decode($title, ENT_QUOTES, 'UTF-8'),
+                    'width' => $w,
+                    'height' => $h,
+                ];
+            }
+        }
+
+        $collected = array_slice($collected, 0, $count);
+        write_log("🖼️ 네이버 이미지 수집 완료: {$keyword} → " . count($collected) . "개 (블로그 우선)");
+        return $collected;
+    }
+
+    /**
+     * ★ v7: 네이버 블로그 검색 → 블로그 글에서 직접 이미지 추출
+     * 이미지 검색 API 대신 블로그 글을 방문해서 이미지를 가져오므로
+     * 블로그 글 내용과 이미지가 실제로 매칭됨
+     */
+    private function extractBlogImages($keyword, $needed, $newsDomains, $newsTitleKeywords) {
+        $clientId = getKey('naver.client_id');
+        $clientSecret = getKey('naver.client_secret');
+        if (!$clientId || !$clientSecret) return [];
+
+        $collected = [];
+
+        // 네이버 블로그 검색 (최신순)
+        $url = "https://openapi.naver.com/v1/search/blog.json?" . http_build_query([
+            'query' => $keyword,
+            'display' => 10,
+            'sort' => 'date', // 최신순
         ]);
-
         $ch = curl_init($url);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 15,
@@ -173,110 +279,49 @@ class WebSearcher {
         $resp = curl_exec($ch); curl_close($ch);
         $data = json_decode($resp, true);
 
-        // ★ v7: 연도 검색 결과가 부족하면 기본 검색어로 재시도
-        if (empty($data['items']) || count($data['items'] ?? []) < 3) {
-            write_log("네이버 이미지: '{$searchKeyword}' 결과 부족 → '{$keyword}'로 재검색");
-            $url2 = "https://openapi.naver.com/v1/search/image?" . http_build_query([
-                'query' => $keyword,
-                'display' => min(30, $count * 5),
-                'sort' => 'sim',
-                'filter' => 'large',
-            ]);
-            $ch = curl_init($url2);
-            curl_setopt_array($ch, [
-                CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 15,
-                CURLOPT_HTTPHEADER => [
-                    'X-Naver-Client-Id: ' . $clientId,
-                    'X-Naver-Client-Secret: ' . $clientSecret,
-                ],
-            ]);
-            $resp = curl_exec($ch); curl_close($ch);
-            $data = json_decode($resp, true);
-        }
+        foreach ($data['items'] ?? [] as $item) {
+            if (count($collected) >= $needed) break;
 
-        // 뉴스 도메인 필터 목록
-        $newsDomains = [
-            'news.naver.com','n.news.naver.com','news.joins.com','news.chosun.com',
-            'news.donga.com','news.hankyung.com','news.mt.co.kr','news.sbs.co.kr',
-            'news.kbs.co.kr','news.mbc.co.kr','news.jtbc.co.kr','newsis.com',
-            'yonhapnews.co.kr','yna.co.kr','edaily.co.kr','mk.co.kr','sedaily.com',
-            'hani.co.kr','khan.co.kr','ohmynews.com','nocutnews.co.kr',
-            'imgnews.naver.net','mimgnews.naver.net', // 네이버 뉴스 이미지 CDN
-        ];
+            $pageUrl = $item['link'] ?? '';
+            $title = strip_tags($item['title'] ?? '');
+            if (!$pageUrl) continue;
 
-        if (!empty($data['items'])) {
-            foreach ($data['items'] as $item) {
-                $imgUrl = $item['link'] ?? '';
-                $sourceUrl = $item['sizeheight'] ?? ''; // 출처 페이지
-                if (!$imgUrl) continue;
-
-                // ★ 뉴스 도메인 필터링
-                $isNews = false;
-                foreach ($newsDomains as $nd) {
-                    if (stripos($imgUrl, $nd) !== false) { $isNews = true; break; }
-                }
-                if ($isNews) continue;
-
-                // ★ v7: 저작권/브랜드/공공기관 이미지 필터링
-                $title = $item['title'] ?? '';
-                $titleLower = mb_strtolower(strip_tags($title));
-                $urlLower = strtolower($imgUrl);
-
-                // 정부/공공기관 도메인 (인포그래픽, 정책 홍보물)
-                $govDomains = ['go.kr', 'gov.kr', 'or.kr', 'ac.kr', 'moel.go.kr', 'mohw.go.kr', 
-                    'mois.go.kr', 'korea.kr', 'bokjiro.go.kr', 'nps.or.kr', 'nhis.or.kr'];
-                $isGov = false;
-                foreach ($govDomains as $gd) {
-                    if (stripos($imgUrl, $gd) !== false) { $isGov = true; break; }
-                }
-                if ($isGov) continue;
-
-                // 기업/브랜드 공식 사이트 이미지 (로고, 워터마크 가능성)
-                $brandPatterns = [
-                    'samsung.com', 'hyundai.com', 'lge.co.kr', 'sk.com', 'kt.com',
-                    'coupang.com', 'kakao.com', 'naver.com/corp', 'toss.im',
-                    'shinhan.com', 'kbstar.com', 'wooribank.com', 'hanabank.com',
-                    '/logo', '/brand', '/ci/', '/watermark', '/official',
-                    'shutterstock.com', 'gettyimages', 'istockphoto', 'adobe.stock',
-                ];
-                $isBrand = false;
-                foreach ($brandPatterns as $bp) {
-                    if (stripos($urlLower, $bp) !== false) { $isBrand = true; break; }
-                }
-                if ($isBrand) continue;
-
-                // 제목에 특정 연도가 포함된 경우 → 현재 연도 아니면 스킵 (오래된 자료 방지)
-                if (preg_match('/20(1\d|2[0-4])년/', $title) && !str_contains($title, $currentYear . '년')) {
-                    continue; // 2010~2024년 자료이고 올해 자료가 아니면 스킵
-                }
-
-                // 너무 작은 이미지 제외 (썸네일 등)
-                $w = intval($item['sizewidth'] ?? 0);
-                $h = intval($item['sizeheight'] ?? 0);
-                if ($w > 0 && $w < 300) continue;
-                if ($h > 0 && $h < 200) continue;
-
-                $collected[] = [
-                    'url' => $imgUrl,
-                    'source' => 'naver_image_api',
-                    'title' => html_entity_decode(strip_tags($item['title'] ?? ''), ENT_QUOTES, 'UTF-8'),
-                    'width' => $w,   // ★ v7: 16:9 선택용
-                    'height' => $h,  // ★ v7: 16:9 선택용
-                ];
-
-                if (count($collected) >= $count) break;
+            // 뉴스 도메인 건너뛰기
+            $isNews = false;
+            foreach ($newsDomains as $nd) {
+                if (stripos($pageUrl, $nd) !== false) { $isNews = true; break; }
             }
+            if ($isNews) continue;
+
+            // 뉴스 제목 키워드 건너뛰기
+            foreach ($newsTitleKeywords as $nk) {
+                if (mb_stripos($title, $nk) !== false) { $isNews = true; break; }
+            }
+            if ($isNews) continue;
+
+            // 블로그 페이지에서 이미지 추출
+            $imgs = $this->scrapeImagesFromPage($pageUrl);
+            foreach ($imgs as $imgUrl) {
+                if (count($collected) >= $needed) break;
+
+                // 중복 URL 체크
+                $isDup = false;
+                foreach ($collected as $c) {
+                    if ($c['url'] === $imgUrl) { $isDup = true; break; }
+                }
+                if (!$isDup) {
+                    $collected[] = [
+                        'url' => $imgUrl,
+                        'source' => 'naver_blog_crawl',
+                        'title' => html_entity_decode($title, ENT_QUOTES, 'UTF-8'),
+                        'width' => 0,  // 크롤링이라 크기 모름
+                        'height' => 0,
+                    ];
+                }
+            }
+            usleep(300000); // 크롤링 간 0.3초 대기
         }
 
-        // ── 2차: 부족하면 블로그/웹 크롤링 페이지에서 이미지 추출 ──
-        if (count($collected) < $count) {
-            $extraNeeded = $count - count($collected);
-            $crawlImages = $this->extractImagesFromSearch($keyword, $extraNeeded, $newsDomains);
-            $collected = array_merge($collected, $crawlImages);
-        }
-
-        $collected = array_slice($collected, 0, $count);
-        write_log("🖼️ 네이버 이미지 수집: {$keyword} → " . count($collected) . "개 (뉴스 제외)");
         return $collected;
     }
 

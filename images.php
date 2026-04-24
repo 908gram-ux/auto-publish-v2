@@ -202,16 +202,22 @@ class StockImageSearch {
 
         $url = "https://generativelanguage.googleapis.com/v1beta/models/{$imageModel}:generateContent?key={$apiKey}";
 
-        // 스타일 다양화 - 사실적 사진 스타일 위주 (v3)
+        // ★ v7: 스타일 다양화 — 포토리얼 강제 해제, 웹 UI처럼 자유로운 스타일
+        // Gemini 웹에서 만드는 것처럼 다양한 비주얼 스타일 허용
         $styles = [
-            'Professional stock photography, natural lighting, sharp focus, realistic details, high resolution',
-            'Cinematic wide-angle photography, dramatic natural lighting, shallow depth of field, photorealistic',
-            'Editorial magazine photography, clean composition, studio-quality lighting, realistic textures',
-            'Documentary-style photography, candid feel, natural colors, authentic atmosphere',
-            'High-end commercial photography, product-shot quality, soft diffused lighting, crisp details',
-            'Lifestyle photography, warm natural tones, cozy atmosphere, realistic setting',
-            'Modern photojournalism style, vivid colors, dynamic composition, real-world context',
-            'Fine art photography, golden hour lighting, rich colors, professional DSLR quality',
+            // 일러스트/그래픽 (웹 UI에서 인기 스타일)
+            'Modern Korean-style illustration, vibrant colors, trendy character design, social media aesthetic, clean lines, eye-catching composition',
+            'Colorful flat illustration with bold outlines, infographic style, modern minimal design, bright saturated palette',
+            'Digital art illustration, Korean webtoon inspired style, dynamic poses, vivid neon accents, urban backdrop',
+            'Cute Korean illustration style, soft pastel colors, rounded shapes, friendly characters, warm atmosphere',
+            '3D isometric illustration, clean geometric shapes, soft shadows, modern tech aesthetic, vibrant gradient colors',
+            // 시네마틱/사진풍
+            'Cinematic photography style, dramatic lighting, shallow depth of field, warm color grading, Korean setting',
+            'High-quality lifestyle photography, natural soft lighting, cozy Korean cafe atmosphere, warm tones',
+            'Modern editorial design, bold typography-friendly layout, clean negative space, professional magazine quality',
+            // 혼합/크리에이티브
+            'Mixed media collage style, combining photography and illustration elements, trendy Korean design aesthetic',
+            'Korean YouTube thumbnail style, eye-catching composition, bold visual elements, dynamic layout, high contrast colors',
         ];
         $chosenStyle = $styles[array_rand($styles)];
 
@@ -220,7 +226,7 @@ class StockImageSearch {
             CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_TIMEOUT => 60,
             CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
             CURLOPT_POSTFIELDS => json_encode([
-                'contents' => [['parts' => [['text' => "Create a photorealistic blog thumbnail image about: {$query}. Style: {$chosenStyle}. RULES: 1) Korean people only (Korean hairstyle, Korean fashion, Korean face). 2) Korean background setting (Seoul streets, Korean buildings, Korean cafe, Korean office, Korean school). 3) ABSOLUTELY NO text, NO letters, NO words, NO numbers, NO characters, NO watermarks anywhere in the image. Pure visual content only. 4) Must be 16:9 wide horizontal aspect ratio. 5) NOT illustration, NOT cartoon, NOT anime, NOT flat design. Must be photorealistic cinema quality. 6) Dramatic cinematic lighting, vivid saturated colors."]]]],
+                'contents' => [['parts' => [['text' => "Create a high-quality blog thumbnail image about: {$query}. Style: {$chosenStyle}. RULES: 1) ABSOLUTELY NO text, NO letters, NO words, NO numbers, NO characters, NO watermarks anywhere in the image. Pure visual content only. The image must contain ZERO text elements. 2) Must be 16:9 wide horizontal aspect ratio. 3) High resolution, professional quality, visually striking. 4) The image should clearly represent the topic at a glance. 5) Korean context preferred (Korean people, Korean settings) when relevant."]]]],
                 'generationConfig' => ['responseModalities' => ['IMAGE', 'TEXT'], 'maxOutputTokens' => 2048],
             ]),
         ]);

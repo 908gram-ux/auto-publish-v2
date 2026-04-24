@@ -913,13 +913,15 @@ class AIRouter {
             }
             if ($inTable) $flushTable();
 
-            // 헤딩
-            if (preg_match('/^#{2,4}\s+(.+)$/', $t, $m)) {
+            // 헤딩 (★ v7: 공백 없는 ###소제목 도 처리, H1 포함)
+            if (preg_match('/^(#{1,4})\s*(.+)$/', $t, $m)) {
                 if ($inList) $flushList();
                 elseif ($inOList) $flushOList();
                 else $flush();
-                $level = strlen(strtok($t, ' '));
-                $text = preg_replace('/\*\*(.+?)\*\*/', '<strong>$1</strong>', $m[1]);
+                $level = strlen($m[1]);
+                if ($level < 2) $level = 2; // H1은 H2로 강제 (블로그에서 H1은 제목이니까)
+                $text = trim($m[2]);
+                $text = preg_replace('/\*\*(.+?)\*\*/', '<strong>$1</strong>', $text);
                 $blocks[] = "<!-- wp:heading {\"level\":{$level}} -->\n<h{$level}>{$text}</h{$level}>\n<!-- /wp:heading -->";
                 continue;
             }
@@ -1004,6 +1006,14 @@ class AIRouter {
         elseif ($inTable) $flushTable();
         else $flush();
 
-        return implode("\n\n", array_filter($blocks));
+        $result = implode("\n\n", array_filter($blocks));
+
+        // ★ v7: 변환 후 남은 마크다운 기호 최종 정리
+        // <p> 안에 남아있는 ### ## # 제거 (헤딩으로 변환 안 된 것들)
+        $result = preg_replace('/<p>\s*#{1,4}\s*/','<p>', $result);
+        // 문단 시작의 ## ### 잔여물
+        $result = preg_replace('/^#{1,4}\s+/m', '', $result);
+
+        return $result;
     }
 }

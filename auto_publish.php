@@ -472,6 +472,14 @@ if (isset($opts['job'])) {
 
             // 이미지 '로컬 폴더' 처리
             if ($postImgSrc === 'local') {
+                // ★ v7: [IMAGE:] 태그를 postImgCnt 만큼만 유지
+                if ($postImgCnt >= 0) {
+                    $imgTagCount = 0;
+                    $post['content_html'] = preg_replace_callback('/\[IMAGE:[^\]]*\]/', function($m) use ($postImgCnt, &$imgTagCount) {
+                        $imgTagCount++;
+                        return ($imgTagCount <= $postImgCnt) ? $m[0] : '';
+                    }, $post['content_html']);
+                }
                 write_log("[3/7] 로컬 이미지 썸네일");
                 $thumb = $image->getLocalThumbnail($kw);
                 if (!$thumb) {
@@ -488,11 +496,25 @@ if (isset($opts['job'])) {
 
             // ★ v6: 이미지 '네이버 수집' 처리
             if ($postImgSrc === 'naver') {
+                // ★ v7: [IMAGE:] 태그를 postImgCnt 만큼만 유지 (4개 설정인데 5개 나오는 버그 수정)
+                if ($postImgCnt >= 0) {
+                    $imgTagCount = 0;
+                    $post['content_html'] = preg_replace_callback('/\[IMAGE:[^\]]*\]/', function($m) use ($postImgCnt, &$imgTagCount) {
+                        $imgTagCount++;
+                        return ($imgTagCount <= $postImgCnt) ? $m[0] : '';
+                    }, $post['content_html']);
+                    if ($imgTagCount > $postImgCnt) {
+                        write_log("⚠️ 이미지 태그 {$imgTagCount}개 → {$postImgCnt}개로 제한 (네이버)");
+                    }
+                }
+
                 write_log("[3/7] 네이버 수집 이미지 썸네일");
-                // 썸네일: 네이버 수집 이미지 중 첫 번째 사용, 없으면 그라데이션
+                // ★ v7: 16:9 비율에 가장 가까운 이미지를 썸네일로 선택
                 $thumb = null;
+                $thumbIdx = 0;
                 if (!empty($naverImages)) {
-                    $thumbUrl = is_array($naverImages[0]) ? ($naverImages[0]['url'] ?? '') : $naverImages[0];
+                    $thumbIdx = $image->pickBestThumbnailIndex($naverImages);
+                    $thumbUrl = is_array($naverImages[$thumbIdx]) ? ($naverImages[$thumbIdx]['url'] ?? '') : $naverImages[$thumbIdx];
                     if ($thumbUrl) {
                         $thumb = $image->downloadNaverImage($thumbUrl);
                     }
@@ -502,10 +524,22 @@ if (isset($opts['job'])) {
                     $thumb = $image->createThumbnail($post['title'], $kw);
                 }
 
+                // ★ v7: 썸네일을 thumbnail 타입으로 최적화 (1200x630 크롭)
+                if ($thumb) {
+                    $thumbOpt = ImageOptimizer::optimize($thumb, 'thumbnail');
+                    if ($thumbOpt && $thumbOpt !== $thumb) {
+                        @unlink($thumb);
+                        $thumb = $thumbOpt;
+                        write_log("🎯 썸네일 16:9(1200x630) 크롭 완료");
+                    }
+                }
+
                 write_log("[4/7] 네이버 수집 이미지 본문 삽입 (최대 {$postImgCnt}개)");
                 ghProgress($jobId, "[4/7] 네이버 이미지 변조+삽입 중...");
-                // 썸네일에 사용한 첫 번째 이미지는 본문용에서 제외
-                $bodyNaverImages = array_slice($naverImages, 1);
+                // 썸네일에 사용한 이미지는 본문용에서 제외
+                $bodyNaverImages = $naverImages;
+                unset($bodyNaverImages[$thumbIdx]);
+                $bodyNaverImages = array_values($bodyNaverImages);
                 $proc = $image->processNaverImages($post['content_html'], $bodyNaverImages, $kw, $postImgCnt);
                 $post['content_html'] = $proc['content'] ?? $post['content_html'];
                 $imgs = $proc['images'] ?? [];
@@ -571,13 +605,18 @@ if (isset($opts['job'])) {
             // 5. WP 업로드
             write_log("[5/7] WP 업로드 ({$site['name']})");
             ghProgress($jobId, "[5/7] WP 업로드 중... ({$site['name']})");
-            $tu = $thumb ? $wp->uploadImage($thumb, $post['title']) : null;
+            // ★ v7: 썸네일 alt에 키워드 포함 (SEO 최적화)
+            $thumbAlt = $kw ? "{$kw} - {$post['title']}" : $post['title'];
+            $tu = $thumb ? $wp->uploadImage($thumb, $thumbAlt) : null;
 
             $contentHtml = $post['content_html'];
             $firstBodyUpload = null; // ← 본문 첫 이미지 업로드 결과 저장
+            $imgUploadIdx = 0;
             foreach ($imgs ?: [] as $img) {
                 $localPath = is_array($img) ? ($img['local'] ?? '') : $img;
-                $altText = is_array($img) ? ($img['alt'] ?? $post['title']) : $post['title'];
+                // ★ v7: 본문 이미지 alt에도 키워드 + 순번 포함 (SEO)
+                $altText = is_array($img) ? ($img['alt'] ?? '') : '';
+                if (!$altText) $altText = $kw ? "{$kw} 관련 이미지 " . (++$imgUploadIdx) : $post['title'];
                 if (!$localPath || !file_exists($localPath)) continue;
                 $up = $wp->uploadImage($localPath, $altText);
                 if ($up) {
@@ -819,13 +858,23 @@ foreach ($sites as $siteIdx => $site) {
                     write_log("[3/7] 네이버 이미지 수집 (뉴스 제외)");
                     $naverImgs = $searcher->searchNaverImages($kw, 5);
                     $thumb = null;
+                    $thumbIdx = 0;
                     if (!empty($naverImgs)) {
-                        $thumbUrl = is_array($naverImgs[0]) ? ($naverImgs[0]['url'] ?? '') : $naverImgs[0];
+                        // ★ v7: 16:9 비율에 가장 가까운 이미지를 썸네일로 선택
+                        $thumbIdx = $image->pickBestThumbnailIndex($naverImgs);
+                        $thumbUrl = is_array($naverImgs[$thumbIdx]) ? ($naverImgs[$thumbIdx]['url'] ?? '') : $naverImgs[$thumbIdx];
                         if ($thumbUrl) $thumb = $image->downloadNaverImage($thumbUrl);
                     }
                     if (!$thumb) $thumb = $image->createThumbnail($post['title'], $kw);
+                    // ★ v7: 썸네일 16:9 크롭 최적화
+                    if ($thumb) {
+                        $thumbOpt = ImageOptimizer::optimize($thumb, 'thumbnail');
+                        if ($thumbOpt && $thumbOpt !== $thumb) { @unlink($thumb); $thumb = $thumbOpt; }
+                    }
                     write_log("[4/7] 네이버 이미지 본문 삽입");
-                    $bodyNaverImgs = array_slice($naverImgs, 1);
+                    $bodyNaverImgs = $naverImgs;
+                    unset($bodyNaverImgs[$thumbIdx]);
+                    $bodyNaverImgs = array_values($bodyNaverImgs);
                     $proc = $image->processNaverImages($post['content_html'], $bodyNaverImgs, $kw, 3);
                     $content = $proc['content']; $imgs = $proc['images'];
                     goto skipImagesCli;

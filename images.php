@@ -700,18 +700,109 @@ class ImageGenerator {
     }
 
     /**
-     * 본문 이미지 처리
-     * [IMAGE: 설명 | search_term] 형식 지원
+     * ★ 이미지 figure HTML 생성 헬퍼
+     * - 이미지를 컨텐츠 가로폭에 꽉 채우지 않음!
+     * - max-width: 560px, 원본이 작으면 그대로 (400px도 OK)
+     * - 중앙 정렬, figcaption SEO, alt 키워드 포함
      */
+    private function buildFigureHtml($src, $altText, $keyword = '') {
+        $safeAlt = htmlspecialchars($altText, ENT_QUOTES, 'UTF-8');
+        // figcaption: alt 텍스트를 설명문으로 활용, 키워드 자연 포함
+        $captionText = $safeAlt;
+        if ($keyword && mb_strpos($altText, $keyword) === false) {
+            $captionText = htmlspecialchars($keyword, ENT_QUOTES, 'UTF-8') . ' - ' . $safeAlt;
+        }
+        return "<!-- wp:image {\"align\":\"center\",\"sizeSlug\":\"medium\"} -->\n"
+             . "<figure class=\"wp-block-image aligncenter size-medium\" style=\"text-align:center;margin:24px auto;\">"
+             . "<img src=\"{$src}\" alt=\"{$safeAlt}\" "
+             . "style=\"max-width:560px;height:auto;display:block;margin:0 auto;border-radius:6px;\" loading=\"lazy\"/>"
+             . "<figcaption class=\"wp-element-caption\" style=\"text-align:center;font-size:13px;color:#888;margin-top:8px;\">"
+             . "{$captionText}</figcaption>"
+             . "</figure>\n<!-- /wp:image -->";
+    }
+
+    /**
+     * ★ v7: 연속 이미지 방지 — [IMAGE:] 태그가 연달아 나오면 재배치
+     * AI가 이미지를 연속으로 배치하면 블로그에서 이미지만 줄줄이 보여서 가독성 최악.
+     * 최소한 문단 1개(100자 이상) 이상의 텍스트가 이미지 사이에 있어야 함.
+     */
+    private function redistributeImageTags($html) {
+        // [IMAGE:] 태그 위치 찾기
+        preg_match_all('/\[IMAGE:[^\]]*\]/', $html, $matches, PREG_OFFSET_CAPTURE);
+        if (count($matches[0]) <= 1) return $html;
+
+        $toMove = []; // 재배치해야 할 태그들
+        $prev = null;
+        foreach ($matches[0] as $idx => $match) {
+            if ($prev !== null) {
+                // 이전 이미지와 현재 이미지 사이의 텍스트 길이
+                $between = substr($html, $prev[1] + strlen($prev[0]), $match[1] - $prev[1] - strlen($prev[0]));
+                $textOnly = trim(strip_tags($between));
+                // 사이에 실질적인 텍스트가 100자 미만이면 → 연속 이미지
+                if (mb_strlen($textOnly) < 100) {
+                    $toMove[] = $match[0]; // 이 태그를 재배치 대상으로 마킹
+                    write_log("⚠️ 연속 이미지 감지 → 재배치: " . mb_substr($match[0], 0, 40));
+                    continue; // prev 갱신 안 함 (이전 이미지 위치 유지)
+                }
+            }
+            $prev = $match;
+        }
+
+        if (empty($toMove)) return $html;
+
+        // 재배치 대상 태그를 원래 위치에서 제거
+        foreach ($toMove as $tag) {
+            $html = preg_replace('/' . preg_quote($tag, '/') . '/', '', $html, 1);
+        }
+
+        // H2/H3 위치 찾기 — 이미지가 없는 섹션에 재배치
+        preg_match_all('/(<h[23][^>]*>|## |### )/', $html, $headings, PREG_OFFSET_CAPTURE);
+        $headingPositions = array_column($headings[0], 1);
+
+        // 이미지가 있는 위치 다시 스캔
+        preg_match_all('/\[IMAGE:[^\]]*\]/', $html, $existingImgs, PREG_OFFSET_CAPTURE);
+        $imgPositions = array_column($existingImgs[0], 1);
+
+        // 이미지 없는 섹션 찾기
+        $emptySlots = [];
+        foreach ($headingPositions as $hPos) {
+            $hasImage = false;
+            foreach ($imgPositions as $iPos) {
+                if (abs($iPos - $hPos) < 500) { $hasImage = true; break; } // 가까운 이미지 있으면 스킵
+            }
+            if (!$hasImage) $emptySlots[] = $hPos;
+        }
+
+        // 재배치
+        $moved = 0;
+        rsort($emptySlots); // 역순으로 삽입 (offset 밀림 방지)
+        foreach ($emptySlots as $pos) {
+            if ($moved >= count($toMove)) break;
+            $tag = $toMove[$moved++];
+            $html = substr($html, 0, $pos) . "\n" . $tag . "\n" . substr($html, $pos);
+        }
+
+        // 남은 태그는 버림 (배치할 곳 없음)
+        if ($moved < count($toMove)) {
+            write_log("⚠️ 재배치 불가 이미지 " . (count($toMove) - $moved) . "개 제거됨");
+        }
+
+        return $html;
+    }
+
     /**
      * 본문 이미지 처리
      * [IMAGE: 설명 | search_term] 형식 지원
      * $aiSearches: AI가 생성한 영문 검색어 배열 (폴백용)
      */
     public function processImages($html, $aiSearches = []) {
+        // ★ v7: 연속 이미지 방지 — 처리 전에 재배치
+        $html = $this->redistributeImageTags($html);
+
         $paths = [];
         $imgIdx = 0;
-        $html = preg_replace_callback('/\[IMAGE:\s*(.+?)\]/', function($m) use(&$paths, &$imgIdx, $aiSearches) {
+        $self = $this;
+        $html = preg_replace_callback('/\[IMAGE:\s*(.+?)\]/', function($m) use(&$paths, &$imgIdx, $aiSearches, $self) {
             $parts = explode('|', $m[1], 2);
             $altText = trim($parts[0]);
 
@@ -721,19 +812,19 @@ class ImageGenerator {
             } elseif (!empty($aiSearches[$imgIdx])) {
                 $searchTerm = $aiSearches[$imgIdx];
             } else {
-                $searchTerm = $this->korToSearchTerm($altText);
+                $searchTerm = $self->korToSearchTerm($altText);
             }
             $imgIdx++;
 
             write_log("이미지 검색: \"{$searchTerm}\" (alt: {$altText})");
 
             // 스톡 이미지 검색
-            $p = $this->stock->search($searchTerm, 'section');
+            $p = $self->stock->search($searchTerm, 'section');
             if (!$p) {
-                $p = $this->createGradientSection($altText);
+                $p = $self->createGradientSection($altText);
             }
             $paths[] = $p;
-            return "<!-- wp:image {\"align\":\"center\",\"sizeSlug\":\"large\"} -->\n<figure class=\"wp-block-image aligncenter size-large\" style=\"max-width:1080px;margin:12px auto;\"><img src=\"{$p}\" alt=\"".htmlspecialchars($altText)."\" style=\"width:100%;height:auto;display:block;\"/></figure>\n<!-- /wp:image -->";
+            return $self->buildFigureHtml($p, $altText);
         }, $html);
         return ['content'=>$html, 'images'=>$paths];
     }
@@ -744,6 +835,9 @@ class ImageGenerator {
      * 남은 이미지는 본문 중간에 자동 삽입
      */
     public function processLocalImages($html, $keyword = '', $imageCount = 3) {
+        // ★ v7: 연속 이미지 방지
+        $html = $this->redistributeImageTags($html);
+
         $localDir = defined('LOCAL_IMAGE_DIR') ? LOCAL_IMAGE_DIR : (__DIR__ . '/local_images/');
         if (!is_dir($localDir)) { @mkdir($localDir, 0755, true); }
 
@@ -776,13 +870,14 @@ class ImageGenerator {
         $usedIdx = 0;
 
         // 1단계: [IMAGE:...] 태그를 로컬 이미지로 교체
-        $html = preg_replace_callback('/\[IMAGE:\s*(.+?)\]/', function($m) use(&$paths, &$usedIdx, $available) {
+        $self = $this;
+        $html = preg_replace_callback('/\[IMAGE:\s*(.+?)\]/', function($m) use(&$paths, &$usedIdx, $available, $self) {
             if ($usedIdx >= count($available)) return ''; // 이미지 부족하면 제거
             $p = $available[$usedIdx++];
             $altText = trim(explode('|', $m[1])[0]);
             $paths[] = $p;
             write_log("로컬 이미지 삽입: " . basename($p) . " (alt: {$altText})");
-            return "<!-- wp:image {\"align\":\"center\",\"sizeSlug\":\"large\"} -->\n<figure class=\"wp-block-image aligncenter size-large\" style=\"max-width:1080px;margin:12px auto;\"><img src=\"{$p}\" alt=\"".htmlspecialchars($altText)."\" style=\"width:100%;height:auto;display:block;\"/></figure>\n<!-- /wp:image -->";
+            return $self->buildFigureHtml($p, $altText);
         }, $html);
 
         // 2단계: 이미지가 더 남았으면 H2 태그 사이에 자동 삽입
@@ -805,7 +900,7 @@ class ImageGenerator {
                     if ($usedIdx >= count($available)) break;
                     $p = $available[$usedIdx++];
                     $paths[] = $p;
-                    $imgHtml = "\n<!-- wp:image {\"align\":\"center\",\"sizeSlug\":\"large\"} -->\n<figure class=\"wp-block-image aligncenter size-large\" style=\"max-width:1080px;margin:12px auto;\"><img src=\"{$p}\" alt=\"".htmlspecialchars($keyword)."\" style=\"width:100%;height:auto;display:block;\"/></figure>\n<!-- /wp:image -->\n";
+                    $imgHtml = "\n" . $this->buildFigureHtml($p, $keyword) . "\n";
                     $html = substr($html, 0, $pos) . $imgHtml . substr($html, $pos);
                     write_log("로컬 이미지 자동 삽입: " . basename($p));
                 }
@@ -814,6 +909,60 @@ class ImageGenerator {
 
         write_log("로컬 이미지 총 " . count($paths) . "개 삽입 (폴더에 " . count($available) . "개 보유)");
         return ['content' => $html, 'images' => $paths];
+    }
+
+    /**
+     * ★ v7: 네이버 이미지 중 16:9(가로형)에 가장 가까운 이미지를 썸네일로 선택
+     * 네이버 API가 반환한 width/height 데이터를 활용 (다운로드 불필요)
+     * 세로형(9:16) 이미지는 절대 썸네일로 사용하지 않음
+     * 
+     * @param array $naverImages searchNaverImages() 반환값 [['url'=>..., 'width'=>..., 'height'=>...], ...]
+     * @return int 가장 적합한 이미지의 인덱스 (기본 0)
+     */
+    public function pickBestThumbnailIndex($naverImages) {
+        if (empty($naverImages) || count($naverImages) <= 1) return 0;
+
+        $targetRatio = 16 / 9; // ≈ 1.778
+        $bestIdx = 0;
+        $bestDiff = PHP_FLOAT_MAX;
+
+        foreach ($naverImages as $idx => $imgData) {
+            if (!is_array($imgData)) continue;
+
+            $w = intval($imgData['width'] ?? 0);
+            $h = intval($imgData['height'] ?? 0);
+
+            // API에서 크기 정보가 없으면 스킵
+            if ($w < 200 || $h < 100) continue;
+
+            $ratio = $w / $h;
+
+            // ★ 세로형 이미지(비율 < 1.0) 완전 제외 — 썸네일로 절대 안 됨
+            if ($ratio < 1.0) {
+                write_log("🚫 세로형 이미지 제외: #{$idx} (비율 " . round($ratio, 2) . ", {$w}x{$h})");
+                continue;
+            }
+
+            $diff = abs($ratio - $targetRatio);
+
+            if ($diff < $bestDiff) {
+                $bestDiff = $diff;
+                $bestIdx = $idx;
+            }
+
+            // 거의 정확한 16:9면 즉시 선택
+            if ($diff < 0.1) {
+                write_log("🎯 썸네일 선택: #{$idx} (비율 " . round($ratio, 2) . " ≈ 16:9, {$w}x{$h})");
+                return $idx;
+            }
+        }
+
+        // 최종 선택된 이미지 로그
+        $selData = $naverImages[$bestIdx] ?? [];
+        $selW = $selData['width'] ?? '?';
+        $selH = $selData['height'] ?? '?';
+        write_log("🎯 썸네일 선택: #{$bestIdx} ({$selW}x{$selH}, 16:9 차이: " . round($bestDiff, 3) . ")");
+        return $bestIdx;
     }
 
     /**
@@ -897,6 +1046,8 @@ class ImageGenerator {
      * @return array ['content'=>수정된HTML, 'images'=>로컬파일경로배열]
      */
     public function processNaverImages($html, $naverImages, $keyword = '', $imageCount = 3) {
+        // ★ v7: 연속 이미지 방지
+        $html = $this->redistributeImageTags($html);
         // 1단계: 이미지 다운로드 + 변조
         $localImages = [];
         $tried = 0;
@@ -928,13 +1079,14 @@ class ImageGenerator {
         $usedIdx = 0;
 
         // 2단계: [IMAGE:...] 태그를 네이버 이미지로 교체
-        $html = preg_replace_callback('/\[IMAGE:\s*(.+?)\]/', function($m) use (&$paths, &$usedIdx, $localImages) {
+        $self = $this;
+        $html = preg_replace_callback('/\[IMAGE:\s*(.+?)\]/', function($m) use (&$paths, &$usedIdx, $localImages, $self, $keyword) {
             if ($usedIdx >= count($localImages)) return ''; // 이미지 부족하면 제거
             $p = $localImages[$usedIdx++];
             $altText = trim(explode('|', $m[1])[0]);
             $paths[] = $p;
             write_log("🖼️ 네이버 이미지 삽입: " . basename($p) . " (alt: {$altText})");
-            return "<!-- wp:image {\"align\":\"center\",\"sizeSlug\":\"large\"} -->\n<figure class=\"wp-block-image aligncenter size-large\" style=\"max-width:1080px;margin:12px auto;\"><img src=\"{$p}\" alt=\"" . htmlspecialchars($altText) . "\" style=\"width:100%;height:auto;display:block;\"/></figure>\n<!-- /wp:image -->";
+            return $self->buildFigureHtml($p, $altText, $keyword);
         }, $html);
 
         // 3단계: 이미지가 남아있고 [IMAGE] 태그보다 이미지가 많으면 H2 사이에 자동 삽입
@@ -954,7 +1106,7 @@ class ImageGenerator {
                     if ($usedIdx >= count($localImages)) break;
                     $p = $localImages[$usedIdx++];
                     $paths[] = $p;
-                    $imgHtml = "\n<!-- wp:image {\"align\":\"center\",\"sizeSlug\":\"large\"} -->\n<figure class=\"wp-block-image aligncenter size-large\" style=\"max-width:1080px;margin:12px auto;\"><img src=\"{$p}\" alt=\"" . htmlspecialchars($keyword) . "\" style=\"width:100%;height:auto;display:block;\"/></figure>\n<!-- /wp:image -->\n";
+                    $imgHtml = "\n" . $this->buildFigureHtml($p, $keyword) . "\n";
                     $html = substr($html, 0, $pos) . $imgHtml . substr($html, $pos);
                     write_log("🖼️ 네이버 이미지 자동 삽입(H2 사이): " . basename($p));
                 }
@@ -1169,7 +1321,7 @@ class ImageOptimizer {
         if (!is_dir($saveDir)) mkdir($saveDir, 0755, true);
         $basename = 'nv_' . time() . '_' . mt_rand(1000, 9999);
 
-        $quality = mt_rand(65, 78); // 랜덤 품질 → 파일 해시 변경
+        $quality = mt_rand(75, 85); // ★ 품질 향상 (65~78 → 75~85): 해시는 변경되면서 화질 유지
         if (function_exists('imagewebp')) {
             $outPath = $saveDir . $basename . '.webp';
             imagewebp($src, $outPath, $quality);
@@ -1202,10 +1354,13 @@ class ImageOptimizer {
         $origW = $info[0]; $origH = $info[1];
 
         // 타입별 최대 크기
+        // ★ content 이미지: 800px로 제한 (720px로 출력하므로 800px이면 충분히 선명)
+        // 1200px 원본을 720px로 출력하면 선명하지만, 네이버 수집 이미지처럼
+        // 원본이 작은 경우 1200px로 키우면 오히려 깨져 보임
         switch ($type) {
             case 'thumbnail': $maxW = 1200; $maxH = 630; $crop = true; break;
-            case 'content':   $maxW = 1200; $maxH = 2000; $crop = false; break;
-            default:          $maxW = 1200; $maxH = 2000; $crop = false; break;
+            case 'content':   $maxW = 800; $maxH = 1400; $crop = false; break;
+            default:          $maxW = 800; $maxH = 1400; $crop = false; break;
         }
 
         // 이미지 로드

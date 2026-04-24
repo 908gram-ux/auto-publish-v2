@@ -323,7 +323,11 @@ class PromptData {
 - 문단 5줄 이내. **굵은 글씨** 강조.
 - 마무리: {$promptSet['closing']}
 
-[이미지] [IMAGE: 한글설명 | english_search_term] 정확히 {$imageCount}개. 0개면 태그 안 넣음.
+[이미지] [IMAGE: SEO 최적화된 한글 설명(키워드 포함, 15~30자) | english_search_term] 정확히 {$imageCount}개. 0개면 태그 안 넣음.
+- 설명은 이미지 아래 캡션으로 표시되므로 자연스러운 문장형. 예: "노트북으로 재택근무하는 직장인의 모습"
+- 키워드를 자연스럽게 포함. 예: 키워드가 "재택근무"면 → [IMAGE: 재택근무 환경을 갖춘 홈오피스 인테리어 | home office workspace]
+- ⛔ 이미지 연속 배치 절대 금지! 이미지와 이미지 사이에 반드시 문단 2개 이상(최소 150자) 텍스트 필요
+- 각 H2 섹션에 1개씩 분산 배치. 한 섹션에 2개 이상 몰아넣기 금지
 
 [Yoast SEO] focus_keyphrase, meta_description(120~155자), slug(영문 3~5단어), tags(8~12개), excerpt(1~2문장)
 
@@ -341,7 +345,7 @@ PROMPT;
 {$ref}{$linkInfo}{$extLinkInfo}
 
 ⛔ 체크리스트:
-① 외부링크 2개+ ② 테이블 3열 이하 ③ H2 {$volStruct['h2_count']}개 ④ 각 H2 문단 {$volStruct['para_per_h2']}개+ ⑤ 상투적 제목 아닌가 ⑥ AI 상투어 0개 ⑦ ## 형식 ⑧ {$minLen}자+ ⑨ 버튼 1~2개 ⑩ 어미 3연속 없음 ⑪ 시각 장치 2가지+ ⑫ H2 구조 다양
+① 외부링크 2개+ ② 테이블 3열 이하 ③ H2 {$volStruct['h2_count']}개 ④ 각 H2 문단 {$volStruct['para_per_h2']}개+ ⑤ 상투적 제목 아닌가 ⑥ AI 상투어 0개 ⑦ ## 형식 ⑧ {$minLen}자+ ⑨ 버튼 1~2개 ⑩ 어미 3연속 없음 ⑪ 시각 장치 2가지+ ⑫ H2 구조 다양 ⑬ 이미지 연속 배치 없음(H2마다 1개씩 분산)
 
 JSON으로만 응답. 사람처럼 자연스럽게. {$minLen}자 이상.
 PROMPT;

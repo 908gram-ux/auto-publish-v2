@@ -150,11 +150,15 @@ class WebSearcher {
 
         $collected = [];
 
-        // ── 1차: 네이버 이미지 검색 API ──
+        // ★ v7: 현재 연도를 검색어에 추가하여 최신 이미지 우선 확보
+        $currentYear = date('Y');
+        $searchKeyword = $keyword . ' ' . $currentYear;
+
+        // ── 1차: 네이버 이미지 검색 API (연도 포함 검색) ──
         $url = "https://openapi.naver.com/v1/search/image?" . http_build_query([
-            'query' => $keyword,
-            'display' => min(20, $count * 4), // 필터링 후 충분한 수 확보
-            'sort' => 'sim',
+            'query' => $searchKeyword,
+            'display' => min(30, $count * 5), // 필터링 후 충분한 수 확보 (더 넉넉하게)
+            'sort' => 'date', // ★ v7: 최신순 정렬 (sim→date)
             'filter' => 'large',
         ]);
 
@@ -168,6 +172,27 @@ class WebSearcher {
         ]);
         $resp = curl_exec($ch); curl_close($ch);
         $data = json_decode($resp, true);
+
+        // ★ v7: 연도 검색 결과가 부족하면 기본 검색어로 재시도
+        if (empty($data['items']) || count($data['items'] ?? []) < 3) {
+            write_log("네이버 이미지: '{$searchKeyword}' 결과 부족 → '{$keyword}'로 재검색");
+            $url2 = "https://openapi.naver.com/v1/search/image?" . http_build_query([
+                'query' => $keyword,
+                'display' => min(30, $count * 5),
+                'sort' => 'sim',
+                'filter' => 'large',
+            ]);
+            $ch = curl_init($url2);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 15,
+                CURLOPT_HTTPHEADER => [
+                    'X-Naver-Client-Id: ' . $clientId,
+                    'X-Naver-Client-Secret: ' . $clientSecret,
+                ],
+            ]);
+            $resp = curl_exec($ch); curl_close($ch);
+            $data = json_decode($resp, true);
+        }
 
         // 뉴스 도메인 필터 목록
         $newsDomains = [
@@ -192,6 +217,39 @@ class WebSearcher {
                 }
                 if ($isNews) continue;
 
+                // ★ v7: 저작권/브랜드/공공기관 이미지 필터링
+                $title = $item['title'] ?? '';
+                $titleLower = mb_strtolower(strip_tags($title));
+                $urlLower = strtolower($imgUrl);
+
+                // 정부/공공기관 도메인 (인포그래픽, 정책 홍보물)
+                $govDomains = ['go.kr', 'gov.kr', 'or.kr', 'ac.kr', 'moel.go.kr', 'mohw.go.kr', 
+                    'mois.go.kr', 'korea.kr', 'bokjiro.go.kr', 'nps.or.kr', 'nhis.or.kr'];
+                $isGov = false;
+                foreach ($govDomains as $gd) {
+                    if (stripos($imgUrl, $gd) !== false) { $isGov = true; break; }
+                }
+                if ($isGov) continue;
+
+                // 기업/브랜드 공식 사이트 이미지 (로고, 워터마크 가능성)
+                $brandPatterns = [
+                    'samsung.com', 'hyundai.com', 'lge.co.kr', 'sk.com', 'kt.com',
+                    'coupang.com', 'kakao.com', 'naver.com/corp', 'toss.im',
+                    'shinhan.com', 'kbstar.com', 'wooribank.com', 'hanabank.com',
+                    '/logo', '/brand', '/ci/', '/watermark', '/official',
+                    'shutterstock.com', 'gettyimages', 'istockphoto', 'adobe.stock',
+                ];
+                $isBrand = false;
+                foreach ($brandPatterns as $bp) {
+                    if (stripos($urlLower, $bp) !== false) { $isBrand = true; break; }
+                }
+                if ($isBrand) continue;
+
+                // 제목에 특정 연도가 포함된 경우 → 현재 연도 아니면 스킵 (오래된 자료 방지)
+                if (preg_match('/20(1\d|2[0-4])년/', $title) && !str_contains($title, $currentYear . '년')) {
+                    continue; // 2010~2024년 자료이고 올해 자료가 아니면 스킵
+                }
+
                 // 너무 작은 이미지 제외 (썸네일 등)
                 $w = intval($item['sizewidth'] ?? 0);
                 $h = intval($item['sizeheight'] ?? 0);
@@ -202,6 +260,8 @@ class WebSearcher {
                     'url' => $imgUrl,
                     'source' => 'naver_image_api',
                     'title' => html_entity_decode(strip_tags($item['title'] ?? ''), ENT_QUOTES, 'UTF-8'),
+                    'width' => $w,   // ★ v7: 16:9 선택용
+                    'height' => $h,  // ★ v7: 16:9 선택용
                 ];
 
                 if (count($collected) >= $count) break;

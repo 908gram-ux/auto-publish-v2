@@ -666,17 +666,9 @@ class ImageGenerator {
     public function createThumbnail($title, $keyword = '', $thumbnailPrompt = '') {
         $query = $keyword ?: $this->korToSearchTerm($title);
         $this->_currentTitle = $title;
-        $this->_thumbnailPrompt = '';  // 썸네일 프롬프트 사용 안 함
+        $this->_thumbnailPrompt = '';
         
-        // 1차: AI 이미지 생성
-        $apiKey = getKey('gemini.api_key');
-        $imageModel = getKey('gemini.image_model', '');
-        if ($apiKey && $imageModel) {
-            $path = $this->fromGemini($query, 'thumbnail');
-            if ($path) return $path;
-        }
-        
-        // 2차: 스톡 이미지 폴백
+        // 1차: 스톡/AI 이미지 (내부에서 Gemini→Pixabay→Pexels 순서대로 시도)
         $stockPath = $this->stock->search($query, 'thumbnail');
         if ($stockPath) return $stockPath;
         

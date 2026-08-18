@@ -168,17 +168,23 @@ class StockImageSearch {
         $apiKey = getKey('gemini.api_key');
         if (!$apiKey) return null;
 
-        $imageModel = getKey('gemini.image_model', 'gemini-2.5-flash-image');
-        if (!$imageModel) $imageModel = 'gemini-2.5-flash-image';
+        // ★ v8: 기본값 Nano Banana 2 Lite (Imagen 4 종료 2026-08-17, 2.5-flash-image 종료 예정 2026-10-02)
+        $imageModel = getKey('gemini.image_model', 'gemini-3.1-flash-lite-image');
+        if (!$imageModel) $imageModel = 'gemini-3.1-flash-lite-image';
 
         // 만료된 모델 자동 교정
         $deprecated = [
-            'gemini-2.5-flash-preview-image-generation' => 'gemini-2.5-flash-image',
-            'gemini-2.5-flash-image-preview' => 'gemini-2.5-flash-image',
-            'gemini-2.0-flash-exp-image-generation' => 'gemini-2.5-flash-image',
-            'gemini-2.0-flash-preview-image-generation' => 'gemini-2.5-flash-image',
-            'imagen-3.0-generate-002' => 'imagen-4.0-generate-001',
-            'imagen-3.0-generate-001' => 'imagen-4.0-generate-001',
+            'gemini-2.5-flash-preview-image-generation' => 'gemini-3.1-flash-lite-image',
+            'gemini-2.5-flash-image-preview' => 'gemini-3.1-flash-lite-image',
+            'gemini-2.0-flash-exp-image-generation' => 'gemini-3.1-flash-lite-image',
+            'gemini-2.0-flash-preview-image-generation' => 'gemini-3.1-flash-lite-image',
+            'gemini-3.1-flash-image-preview' => 'gemini-3.1-flash-image',   // 2026-06-25 종료
+            'gemini-3-pro-image-preview' => 'gemini-3-pro-image',           // 2026-06-25 종료
+            'imagen-3.0-generate-002' => 'gemini-3.1-flash-lite-image',
+            'imagen-3.0-generate-001' => 'gemini-3.1-flash-lite-image',
+            'imagen-4.0-generate-001' => 'gemini-3.1-flash-lite-image',      // 2026-08-17 종료
+            'imagen-4.0-fast-generate-001' => 'gemini-3.1-flash-lite-image', // 2026-08-17 종료
+            'imagen-4.0-ultra-generate-001' => 'gemini-3.1-flash-image',     // 2026-08-17 종료
         ];
         if (isset($deprecated[$imageModel])) {
             $oldModel = $imageModel;
@@ -234,7 +240,10 @@ class StockImageSearch {
         if ($code !== 200) {
             write_log("Gemini 이미지 HTTP {$code} (모델: {$imageModel})");
             if ($code === 404) {
-                write_log("💡 '{$imageModel}' 만료/미지원. 관리자 → 전체 키 관리에서 'Nano Banana (추천)' 또는 'Imagen 4 Fast'로 변경하세요");
+                write_log("💡 '{$imageModel}' 만료/미지원. 관리자 → 전체 키 관리에서 'Nano Banana 2 Lite'로 변경하세요");
+            }
+            if ($code === 429 || $code === 403 || $code === 400) {
+                write_log("💡 Gemini 이미지 생성은 무료 티어에서 제공되지 않습니다(유료 전용). 결제 미연결이면 이미지 소스를 pixabay/pexels/naver로 두세요");
             }
             return null;
         }
@@ -285,7 +294,7 @@ class StockImageSearch {
         $resp = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
         if ($code !== 200) {
             write_log("Imagen HTTP {$code} (모델: {$model})");
-            if ($code === 404) write_log("💡 '{$model}' 만료. 관리자에서 'Imagen 4 Fast' 선택 권장");
+            if ($code === 404) write_log("💡 Imagen 계열은 2026-08-17 종료. 관리자에서 'Nano Banana 2 Lite' 선택 권장");
             return null;
         }
 

@@ -42,6 +42,12 @@ function getModelMaxTokens(string $model): int {
         'gemini-2.5-flash-lite' => 65536,
         'gemini-2.5-flash' => 65536,
         'gemini-2.5-pro' => 65536,
+        'gemini-3.5-flash-lite' => 65536,
+        'gemini-3.5-flash' => 65536,
+        'gemini-3.6-flash' => 65536,
+        'gemini-3.7-flash' => 65536,
+        'gemini-3.1-flash-lite' => 65536,
+        'gemini-3.1-pro-preview' => 65536,
     ];
 
     // 정확한 매칭
@@ -251,13 +257,20 @@ class GeminiProvider implements AIProvider {
         $apiKey = getKey('gemini.api_key');
         $maxTokens = clampMaxTokens($model, $maxTokens);
         $isPro = (strpos($model, 'pro') !== false);
-        write_log("Gemini 모델: {$model}" . ($isPro ? " (Pro 모드)" : ""));
+        $isGen3 = (strpos($model, 'gemini-3') === 0);   // ★ v9: Gemini 3.x 계열 (thinkingLevel 사용)
+        write_log("Gemini 모델: {$model}" . ($isPro ? " (Pro 모드)" : "") . ($isGen3 ? " [3.x]" : ""));
 
         // ── Pro vs Flash 설정 분기 ──
         // Pro: thinking 활성화 (최소 1024, 여유 있게 8192), 긴 타임아웃
         // Flash: thinking 비활성화, 일반 타임아웃
+        // ★ v9: Gemini 3.x는 thinkingBudget 대신 thinkingLevel(low/high) 사용, thinking 완전 비활성 불가
         $genConfig = ['maxOutputTokens' => $maxTokens];
-        if ($isPro) {
+        if ($isGen3) {
+            $genConfig['thinkingConfig'] = ['thinkingLevel' => $isPro ? 'high' : 'low'];
+            $timeout = $isPro ? 600 : 300;   // 3.x Flash도 thinking 있음 → 5분
+            $connectTimeout = 20;
+            $maxRetries = 3;
+        } elseif ($isPro) {
             // ★ v4: thinkingBudget 축소 (8192→4096) — 블로그 글 생성은 thinking보다 출력이 중요
             $genConfig['thinkingConfig'] = ['thinkingBudget' => 4096];
             $timeout = 600;       // Pro: 10분
@@ -284,7 +297,7 @@ class GeminiProvider implements AIProvider {
                 write_log("Gemini 재시도 {$attempt}/{$maxRetries} ({$waitSec}초 대기)");
                 sleep($waitSec);
                 // 재시도 시 thinkingBudget 줄여서 속도 확보
-                if ($isPro) {
+                if ($isPro && !$isGen3) {
                     $genConfig['thinkingConfig']['thinkingBudget'] = max(1024, 8192 - ($attempt * 2048));
                     $payload = json_encode([
                         'system_instruction' => ['parts' => [['text' => $system]]],

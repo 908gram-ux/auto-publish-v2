@@ -318,11 +318,18 @@ class StockImageSearch {
         $apiKey = getKey('chatgpt.api_key');
         if (!$apiKey) return null;
 
-        $dalleModel = getKey('chatgpt.image_model', 'dall-e-2');
-        if (!$dalleModel) $dalleModel = 'dall-e-2';
+        $dalleModel = getKey('chatgpt.image_model', 'gpt-image-2');
+        if (!$dalleModel) $dalleModel = 'gpt-image-2';
+        // ★ v9.1: DALL-E 2/3은 2026-05-12 API 종료 → gpt-image-2로 자동 교정
+        if (str_starts_with($dalleModel, 'dall-e')) {
+            write_log("⚠️ 이미지 모델 자동 교정: {$dalleModel} → gpt-image-2 (DALL-E API 종료)");
+            $dalleModel = 'gpt-image-2';
+            $keys = loadApiKeys(); $keys['chatgpt']['image_model'] = 'gpt-image-2'; saveApiKeys($keys);
+        }
+        $isGptImage = str_starts_with($dalleModel, 'gpt-image');
 
-        // 모델별 사이즈 설정
-        $size = ($dalleModel === 'dall-e-3') ? '1792x1024' : '1024x1024';
+        // 모델별 사이즈 설정 (gpt-image: 1536x1024 가로형 지원)
+        $size = $isGptImage ? '1536x1024' : (($dalleModel === 'dall-e-3') ? '1792x1024' : '1024x1024');
 
         $styles = [
             'minimalist flat illustration', 'watercolor painting', 'isometric 3D art',
@@ -332,8 +339,13 @@ class StockImageSearch {
         $chosenStyle = $styles[array_rand($styles)];
         $prompt = "A {$chosenStyle} blog header image about: {$query}. CRITICAL: ABSOLUTELY NO text, NO letters, NO words, NO numbers, NO watermarks anywhere. Pure visual content only. High quality, professional.";
 
-        $body = ['model' => $dalleModel, 'prompt' => $prompt, 'n' => 1, 'size' => $size, 'response_format' => 'b64_json'];
-        if ($dalleModel === 'dall-e-3') $body['quality'] = 'standard';
+        $body = ['model' => $dalleModel, 'prompt' => $prompt, 'n' => 1, 'size' => $size];
+        if ($isGptImage) {
+            $body['quality'] = 'medium';   // gpt-image는 항상 b64_json 반환, response_format 파라미터 미지원
+        } else {
+            $body['response_format'] = 'b64_json';
+            if ($dalleModel === 'dall-e-3') $body['quality'] = 'standard';
+        }
 
         $ch = curl_init('https://api.openai.com/v1/images/generations');
         curl_setopt_array($ch, [
@@ -343,7 +355,7 @@ class StockImageSearch {
         ]);
         $resp = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
         if ($code !== 200) {
-            write_log("DALL-E HTTP {$code} (모델: {$dalleModel})");
+            write_log("OpenAI 이미지 HTTP {$code} (모델: {$dalleModel}): " . mb_substr($resp, 0, 200));
             return null;
         }
 

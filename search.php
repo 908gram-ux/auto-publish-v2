@@ -300,7 +300,8 @@ class WebSearcher {
             if ($isNews) continue;
 
             // 블로그 페이지에서 이미지 추출
-            $imgs = $this->scrapeImagesFromPage($pageUrl);
+            // ★ v8: 한 글에서 최대 2장만 → 여러 글에서 골고루 수집 (AI 판별 후보 다양성 확보)
+            $imgs = $this->scrapeImagesFromPage($pageUrl, 2);
             foreach ($imgs as $imgUrl) {
                 if (count($collected) >= $needed) break;
 
@@ -388,7 +389,7 @@ class WebSearcher {
     /**
      * ★ v6: 개별 페이지에서 이미지 URL 스크래핑
      */
-    private function scrapeImagesFromPage($url) {
+    private function scrapeImagesFromPage($url, $maxPerPage = 3) {
         if (!$url || !filter_var($url, FILTER_VALIDATE_URL)) return [];
 
         // 네이버 블로그는 모바일 버전이 크롤링 용이
@@ -436,10 +437,153 @@ class WebSearcher {
             }
 
             $images[] = $imgSrc;
-            if (count($images) >= 3) break; // 페이지당 최대 3개
+            if (count($images) >= $maxPerPage) break; // 페이지당 최대 N개
         }
 
         return $images;
+    }
+
+    /**
+     * ★ v8: 구글 이미지 검색 (Serper → Google CSE 순서)
+     * - serper.api_key 가 있으면 Serper images 엔드포인트 사용 (빠르고 결과 많음)
+     * - 없으면 google.search_api_key + google.search_cx 로 Google Custom Search(searchType=image)
+     * - 둘 다 없으면 빈 배열
+     *
+     * @return array [['url'=>..., 'source'=>'google_serper'|'google_cse', 'title'=>..., 'width'=>..,'height'=>.., 'page'=>..], ...]
+     */
+    public function searchGoogleImages($keyword, $count = 8) {
+        $collected = [];
+        $serperKey = getKey('serper.api_key');
+        $gKey = getKey('google.search_api_key');
+        $gCx  = getKey('google.search_cx');
+
+        $badDomains = [
+            // 뉴스/언론
+            'news.naver.com','imgnews.naver.net','mimgnews.naver.net','yna.co.kr','yonhapnews','newsis.com',
+            'chosun.com','donga.com','joins.com','joongang.co.kr','hani.co.kr','khan.co.kr','mk.co.kr','hankyung.com',
+            'sedaily.com','edaily.co.kr','mt.co.kr','sbs.co.kr','kbs.co.kr','imbc.com','jtbc.co.kr','ytn.co.kr',
+            'ohmynews.com','nocutnews.co.kr','newspim.com','news1.kr','dailian.co.kr','heraldcorp.com',
+            // 스톡/저작권 강한 사이트
+            'shutterstock','gettyimages','istockphoto','alamy','adobe.com','123rf','dreamstime','depositphotos','pinterest',
+            // 정부/공공
+            '.go.kr','.gov.kr','korea.kr',
+            // 쇼핑몰 상품 이미지
+            'coupang','11st','gmarket','auction.co.kr','smartstore','musinsa','oliveyoung','amazon.','aliexpress',
+        ];
+        $isBad = function($u) use ($badDomains) {
+            foreach ($badDomains as $d) if (stripos($u, $d) !== false) return true;
+            return false;
+        };
+        $push = function($imgUrl, $title, $w, $h, $page, $src) use (&$collected, $isBad) {
+            if (!$imgUrl || !preg_match('#^https?://#i', $imgUrl)) return;
+            if ($isBad($imgUrl) || $isBad((string)$page)) return;
+            if (preg_match('/\.(svg|ico)(\?|$)/i', $imgUrl)) return;
+            if (preg_match('/(icon|logo|button|banner|sprite|emoji|avatar|profile)/i', $imgUrl)) return;
+            if ($w > 0 && $w < 400) return;
+            if ($h > 0 && $h < 250) return;
+            if ($w > 0 && $h > 0 && ($w / $h) < 0.6) return; // 지나친 세로형 제외
+            foreach ($collected as $c) if ($c['url'] === $imgUrl) return;
+            $collected[] = ['url' => $imgUrl, 'source' => $src, 'title' => (string)$title, 'width' => (int)$w, 'height' => (int)$h, 'page' => (string)$page];
+        };
+
+        // ── 1) Serper ──
+        if ($serperKey) {
+            $ch = curl_init('https://google.serper.dev/images');
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true, CURLOPT_TIMEOUT => 20,
+                CURLOPT_HTTPHEADER => ['X-API-KEY: ' . $serperKey, 'Content-Type: application/json'],
+                CURLOPT_POSTFIELDS => json_encode(['q' => $keyword, 'gl' => 'kr', 'hl' => 'ko', 'num' => min(30, $count * 4)]),
+            ]);
+            $resp = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+            if ($code === 200) {
+                $data = json_decode($resp, true);
+                foreach ($data['images'] ?? [] as $it) {
+                    if (count($collected) >= $count) break;
+                    $push($it['imageUrl'] ?? '', $it['title'] ?? '', $it['imageWidth'] ?? 0, $it['imageHeight'] ?? 0, $it['link'] ?? '', 'google_serper');
+                }
+                write_log("🖼️ 구글(Serper) 이미지 수집: {$keyword} → " . count($collected) . "개");
+            } else {
+                write_log("⚠️ Serper 이미지 검색 실패: HTTP {$code} " . mb_substr((string)$resp, 0, 150));
+            }
+        }
+
+        // ── 2) Google Custom Search (부족하거나 Serper 없음) ──
+        if (count($collected) < $count && $gKey && $gCx) {
+            $before = count($collected);
+            $need = $count - $before;
+            $pages = (int)ceil(min(20, $need * 2) / 10);
+            for ($pg = 0; $pg < $pages && count($collected) < $count; $pg++) {
+                $url = 'https://www.googleapis.com/customsearch/v1?' . http_build_query([
+                    'key' => $gKey, 'cx' => $gCx, 'q' => $keyword, 'searchType' => 'image',
+                    'num' => 10, 'start' => 1 + $pg * 10, 'imgSize' => 'large', 'safe' => 'active',
+                    'gl' => 'kr', 'hl' => 'ko',
+                ]);
+                // 선택: api_keys.json → google.image_rights = "cc_publicdomain|cc_attribute|cc_sharealike" 로 재사용 허용 이미지만 검색
+                $rights = trim((string)getKey('google.image_rights', ''));
+                if ($rights) $url .= '&rights=' . urlencode($rights);
+                $ch = curl_init($url);
+                curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 20]);
+                $resp = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch);
+                if ($code !== 200) { write_log("⚠️ Google CSE 이미지 검색 실패: HTTP {$code} " . mb_substr((string)$resp, 0, 150)); break; }
+                $data = json_decode($resp, true);
+                foreach ($data['items'] ?? [] as $it) {
+                    if (count($collected) >= $count) break;
+                    $im = $it['image'] ?? [];
+                    $push($it['link'] ?? '', $it['title'] ?? '', $im['width'] ?? 0, $im['height'] ?? 0, $im['contextLink'] ?? '', 'google_cse');
+                }
+            }
+            write_log("🖼️ 구글(CSE) 이미지 수집: {$keyword} → " . (count($collected) - $before) . "개");
+        }
+
+        if (!$serperKey && !($gKey && $gCx)) {
+            write_log("ℹ️ 구글 이미지 검색 키 없음 (serper.api_key 또는 google.search_api_key+search_cx) → 구글 수집 건너뜀");
+        }
+        return array_slice($collected, 0, $count);
+    }
+
+    /**
+     * ★ v8: 네이버 + 구글 통합 이미지 후보 수집
+     * AI 판별(ImageJudge)에 넘길 후보 풀을 넉넉히 만듭니다.
+     *
+     * @param string $keyword
+     * @param int    $count   최종 필요한 이미지 수(썸네일 포함). 후보는 이보다 넉넉히 수집
+     * @param string $prefer  'naver' | 'google' — 먼저 채울 소스
+     * @return array 통합 후보 배열 (url 중복 제거, 소스 섞임)
+     */
+    public function searchWebImages($keyword, $count = 5, $prefer = 'naver') {
+        $poolSize = max(8, $count * 3);            // AI가 고를 수 있게 3배 수집
+        $half = (int)ceil($poolSize / 2);
+
+        $naver = [];
+        $google = [];
+        $naverOk = getKey('naver.client_id') && getKey('naver.client_secret');
+        $googleOk = getKey('serper.api_key') || (getKey('google.search_api_key') && getKey('google.search_cx'));
+
+        if ($prefer === 'google') {
+            if ($googleOk) $google = $this->searchGoogleImages($keyword, $half + 2);
+            if ($naverOk)  $naver  = $this->searchNaverImages($keyword, $poolSize - count($google));
+        } else {
+            if ($naverOk)  $naver  = $this->searchNaverImages($keyword, $half + 2);
+            if ($googleOk) $google = $this->searchGoogleImages($keyword, $poolSize - count($naver));
+        }
+
+        // 번갈아 섞기 (한 소스에만 편중 방지)
+        $merged = [];
+        $seen = [];
+        $a = $prefer === 'google' ? $google : $naver;
+        $b = $prefer === 'google' ? $naver : $google;
+        $max = max(count($a), count($b));
+        for ($i = 0; $i < $max; $i++) {
+            foreach ([$a, $b] as $list) {
+                if (!isset($list[$i])) continue;
+                $u = $list[$i]['url'] ?? '';
+                if (!$u || isset($seen[$u])) continue;
+                $seen[$u] = true;
+                $merged[] = $list[$i];
+            }
+        }
+        write_log("🖼️ 통합 이미지 후보: 네이버 " . count($naver) . "개 + 구글 " . count($google) . "개 = " . count($merged) . "개 (우선: {$prefer})");
+        return array_slice($merged, 0, $poolSize);
     }
 
     /** Naver 테스트 결과 반환 */

@@ -115,7 +115,7 @@ class ImageJudge {
      *
      * @param array $candidates [['url'=>..., 'local_raw'=>로컬경로(있으면), 'title'=>..., 'source'=>...], ...]
      * @param array $ctx ['title'=>글제목, 'keyword'=>키워드, 'summary'=>글요약, 'image_descs'=>[본문 [IMAGE:] 설명들]]
-     * @return array|null  [$idx => ['score'=>int, 'thumb_ok'=>bool, 'has_text'=>bool, 'reason'=>string]]  (AI 전부 실패 시 null)
+     * @return array|null  [$idx => ['score'=>int, 'thumb_ok'=>bool, 'has_text'=>bool, 'reason'=>string, 'caption'=>string]]  (AI 전부 실패 시 null)
      */
     public function judge(array $candidates, array $ctx) {
         if (empty($candidates)) return null;
@@ -154,9 +154,10 @@ class ImageJudge {
         $user .= "- score (0~10): 글의 주제·분위기와 얼마나 맞는가. 주제와 무관(지도, 광고, 메뉴판, 캡처화면, 로고, 배너, 프로필사진, 다른 제품/인물)이면 0~2.\n";
         $user .= "- thumb_ok (true/false): 대표 이미지로 써도 되는가. 가로형이고, 글자/워터마크/자막/말풍선이 거의 없고, 주제를 한눈에 보여주는 깨끗한 사진일 때만 true. 세로형, 캡처화면, 표/그래프, 글자 가득한 이미지는 false.\n";
         $user .= "- has_text (true/false): 이미지 안에 글자/자막/워터마크/로고가 눈에 띄게 있는가.\n";
-        $user .= "- reason: 10~20자 한국어 한 줄 이유.\n\n";
+        $user .= "- reason: 10~20자 한국어 한 줄 이유.\n";
+        $user .= "- caption: 이 이미지 **실제 내용**을 설명하는 15~30자 한국어 캡션. 반드시 이미지에 보이는 것을 그대로 묘사(예: 순위표 캡처면 '2026 K리그1 순위표', 경기 사진이면 '경기 중인 선수들'). 이미지에 없는 내용을 지어내지 말 것. 가능하면 키워드 '{$keyword}' 자연스럽게 포함.\n\n";
         $user .= "## 출력 형식 (JSON만)\n";
-        $user .= '{"results":[{"n":1,"score":8,"thumb_ok":true,"has_text":false,"reason":"..."},{"n":2,...}]}';
+        $user .= '{"results":[{"n":1,"score":8,"thumb_ok":true,"has_text":false,"reason":"...","caption":"..."},{"n":2,...}]}';
 
         // 3) 모델 순서대로 시도
         $order = ['gemini', 'chatgpt', 'grok', 'claude'];
@@ -203,11 +204,12 @@ class ImageJudge {
                 'thumb_ok' => $thumbOk,
                 'has_text' => $hasText,
                 'reason' => mb_substr(trim((string)($r['reason'] ?? '')), 0, 40),
+                'caption' => mb_substr(trim(str_replace(["\n", '"'], ' ', (string)($r['caption'] ?? ''))), 0, 60),
             ];
         }
         // 판별 누락된 후보는 낮은 점수
         foreach ($previews as $idx => $_) {
-            if (!isset($out[$idx])) $out[$idx] = ['score' => 1, 'thumb_ok' => false, 'has_text' => false, 'reason' => '판별 누락'];
+            if (!isset($out[$idx])) $out[$idx] = ['score' => 1, 'thumb_ok' => false, 'has_text' => false, 'reason' => '판별 누락', 'caption' => ''];
         }
 
         $logParts = [];

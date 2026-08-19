@@ -518,7 +518,7 @@ if (isset($opts['job'])) {
                     $sel = $image->selectWebImages($naverImages, $post, $kw, $postImgCnt);
                     $bodyNaverImages = $sel['body'];
                     if (!empty($sel['thumb_raw'])) {
-                        $thumb = $image->prepareFromRaw($sel['thumb_raw']);
+                        $thumb = $image->prepareFromRaw($sel['thumb_raw'], true);
                     }
                 }
                 if (!$thumb) {
@@ -861,7 +861,7 @@ foreach ($sites as $siteIdx => $site) {
                     if (!empty($naverImgs)) {
                         $sel = $image->selectWebImages($naverImgs, $post, $kw, $cliImgCnt);
                         $bodyNaverImgs = $sel['body'];
-                        if (!empty($sel['thumb_raw'])) $thumb = $image->prepareFromRaw($sel['thumb_raw']);
+                        if (!empty($sel['thumb_raw'])) $thumb = $image->prepareFromRaw($sel['thumb_raw'], true);
                     }
                     if (!$thumb) $thumb = $image->createThumbnail($post['title'], $kw, $post['thumbnail_prompt'] ?? '');
                     // ★ v7: 썸네일 16:9 크롭 최적화

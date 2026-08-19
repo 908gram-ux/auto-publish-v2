@@ -990,7 +990,7 @@ class ImageGenerator {
      * @param string $rawPath ImageJudge::downloadRaw() 등이 저장한 원본 경로
      * @return string|null 변조 완료된 경로
      */
-    public function prepareFromRaw($rawPath) {
+    public function prepareFromRaw($rawPath, $isThumb = false) {
         if (!$rawPath || !file_exists($rawPath)) return null;
         $tmpPath = $rawPath;
         $optimized = ImageOptimizer::optimize($tmpPath, 'content');
@@ -998,7 +998,8 @@ class ImageGenerator {
             @unlink($tmpPath);
             $tmpPath = $optimized;
         }
-        $disguised = ImageOptimizer::disguise($tmpPath);
+        // 썸네일은 뒤에서 1200x630 레터박스(번짐 배경)를 입히므로 여기서는 덧대기 생략 (이중 테두리 방지)
+        $disguised = ImageOptimizer::disguise($tmpPath, !$isThumb);
         if ($disguised && $disguised !== $tmpPath) {
             @unlink($tmpPath);
             return $disguised;
@@ -1019,7 +1020,7 @@ class ImageGenerator {
      * @param array  $post       AI가 생성한 글 (title, excerpt/meta_description, content_html 사용)
      * @param string $keyword
      * @param int    $imageCount 본문 이미지 개수
-     * @return array ['thumb_raw'=>원본경로|null, 'body'=>[후보배열(local_raw 포함)], 'ai_judged'=>bool]
+     * @return array ['thumb_raw'=>원본경로|null, 'thumb_caption'=>AI캡션, 'body'=>[후보배열(local_raw, ai_caption 포함)], 'ai_judged'=>bool]
      */
     public function selectWebImages(array $candidates, array $post, $keyword, $imageCount = 3) {
         $judge = new ImageJudge();
@@ -1077,24 +1078,31 @@ class ImageGenerator {
                     if ($h > 0 && $w / $h >= 1.15 && !$sc['has_text'] && $sc['score'] > $best && $sc['score'] >= 4) { $best = $sc['score']; $thumbIdx = $idx; }
                 }
             }
+            $thumbCaption = '';
             if ($thumbIdx !== null) {
+                $thumbCaption = $scores[$thumbIdx]['caption'] ?? '';
                 write_log("🎯 AI 썸네일 선택: #{$thumbIdx} {$scores[$thumbIdx]['score']}점 ({$scores[$thumbIdx]['reason']}) ← " . substr($ready[$thumbIdx]['url'] ?? '', 0, 70));
             } else {
                 write_log("⚠️ AI 판별 결과 썸네일로 적합한 이미지 없음 → 썸네일은 생성(그라데이션/AI) 폴백");
             }
-            // 4) 본문: 점수순, 관련 없는 건 제외
+            // 4) 본문: 점수순. ★ v8.1: 관련도 기준(기본 5점) 미만은 **절대 사용 안 함**
+            //    → 5개 설정해도 맞는 이미지가 2~3개면 2~3개만 넣음 (억지로 채우지 않음)
+            $minScore = intval(getKey('image_source.min_relevance', 5));
             $body = [];
             foreach ($scores as $idx => $sc) {
                 if ($idx === $thumbIdx) continue;
-                $body[] = ['cand' => $ready[$idx], 'score' => $sc['score']];
+                $cand = $ready[$idx];
+                $cand['ai_caption'] = $sc['caption'] ?? '';   // 캡션을 후보에 실어 보냄
+                $cand['ai_score'] = $sc['score'];
+                $body[] = ['cand' => $cand, 'score' => $sc['score']];
             }
             usort($body, fn($a, $b) => $b['score'] <=> $a['score']);
-            $bodyGood = array_values(array_filter($body, fn($b) => $b['score'] >= 3));
-            // 관련 이미지가 부족하면 낮은 점수라도 채움 (이미지 없는 것보단 낫게)
-            $bodyList = count($bodyGood) >= $imageCount ? $bodyGood : $body;
-            if (count($bodyGood) < count($body)) write_log("🧹 관련 없는 이미지 " . (count($body) - count($bodyGood)) . "개 본문에서 제외");
-            $bodyCands = array_map(fn($b) => $b['cand'], $bodyList);
-            return ['thumb_raw' => $thumbIdx !== null ? $ready[$thumbIdx]['local_raw'] : null, 'body' => $bodyCands, 'ai_judged' => true];
+            $bodyGood = array_values(array_filter($body, fn($b) => $b['score'] >= $minScore));
+            $dropped = count($body) - count($bodyGood);
+            if ($dropped > 0) write_log("🧹 관련도 {$minScore}점 미만 이미지 {$dropped}개 제외 → 본문에 쓸 수 있는 이미지 " . count($bodyGood) . "개 (설정 {$imageCount}개)");
+            if (count($bodyGood) < $imageCount) write_log("ℹ️ 내용에 맞는 이미지가 설정({$imageCount}개)보다 적어 " . count($bodyGood) . "개만 사용합니다");
+            $bodyCands = array_map(fn($b) => $b['cand'], $bodyGood);
+            return ['thumb_raw' => $thumbIdx !== null ? $ready[$thumbIdx]['local_raw'] : null, 'thumb_caption' => $thumbCaption, 'body' => $bodyCands, 'ai_judged' => true];
         }
 
         // AI 실패 → 기존 16:9 비율 방식
@@ -1102,7 +1110,7 @@ class ImageGenerator {
         $ti = $this->pickBestThumbnailIndex($readyList);
         $thumbRaw = $readyList[$ti]['local_raw'] ?? null;
         unset($readyList[$ti]);
-        return ['thumb_raw' => $thumbRaw, 'body' => array_values($readyList), 'ai_judged' => false];
+        return ['thumb_raw' => $thumbRaw, 'thumb_caption' => '', 'body' => array_values($readyList), 'ai_judged' => false];
     }
 
     /**
@@ -1197,6 +1205,8 @@ class ImageGenerator {
         $html = $this->redistributeImageTags($html);
         // 1단계: 이미지 다운로드 + 변조
         $localImages = [];
+        $localCaptions = []; // ★ v8.1: AI가 이미지를 보고 쓴 캡션 (없으면 '')
+        $aiJudged = !empty($naverImages) && is_array($naverImages[0] ?? null) && array_key_exists('ai_caption', $naverImages[0]);
         $tried = 0;
         foreach ($naverImages as $imgData) {
             if (count($localImages) >= $imageCount + 1) break; // 여유분 1개
@@ -1210,12 +1220,18 @@ class ImageGenerator {
             $localPath = $this->downloadNaverImage(is_array($imgData) ? $imgData : $url);
             if ($localPath) {
                 $localImages[] = $localPath;
+                $localCaptions[] = is_array($imgData) ? trim((string)($imgData['ai_caption'] ?? '')) : '';
                 write_log("🖼️ 네이버 이미지 준비 완료: " . basename($localPath) . " ← " . substr($url, 0, 80));
             }
             usleep(500000); // 다운로드 간 0.5초 대기
         }
 
         if (empty($localImages)) {
+            if ($aiJudged) {
+                // ★ v8.1: AI 판별 후 내용에 맞는 이미지가 0개 → 엉뚱한 이미지 대신 [IMAGE] 태그만 제거 (이미지 없이 발행)
+                write_log("ℹ️ 내용에 맞는 수집 이미지가 없음 → 본문 이미지 없이 진행 ([IMAGE] 태그 제거)");
+                return ['content' => preg_replace('/\[IMAGE:[^\]]*\]/', '', $html), 'images' => []];
+            }
             write_log("⚠️ 네이버 이미지 수집 실패 → [IMAGE] 태그 제거, 그라데이션 폴백");
             // 폴백: 기존 processImages 로직 사용
             return $this->processImages($html);
@@ -1228,10 +1244,12 @@ class ImageGenerator {
 
         // 2단계: [IMAGE:...] 태그를 네이버 이미지로 교체
         $self = $this;
-        $html = preg_replace_callback('/\[IMAGE:\s*(.+?)\]/', function($m) use (&$paths, &$usedIdx, $localImages, $self, $keyword) {
+        $html = preg_replace_callback('/\[IMAGE:\s*(.+?)\]/', function($m) use (&$paths, &$usedIdx, $localImages, $localCaptions, $self, $keyword) {
             if ($usedIdx >= count($localImages)) return ''; // 이미지 부족하면 제거
-            $p = $localImages[$usedIdx++];
-            $altText = trim(explode('|', $m[1])[0]);
+            $p = $localImages[$usedIdx];
+            // ★ v8.1: 캡션은 AI가 '실제 이미지'를 보고 쓴 것을 우선 사용. 없으면 글의 [IMAGE:] 설명
+            $altText = $localCaptions[$usedIdx] ?: trim(explode('|', $m[1])[0]);
+            $usedIdx++;
             $paths[] = $p;
             write_log("🖼️ 네이버 이미지 삽입: " . basename($p) . " (alt: {$altText})");
             return $self->buildFigureHtml($p, $altText, $keyword);
@@ -1252,9 +1270,11 @@ class ImageGenerator {
                 rsort($insertPoints); // 역순 삽입 (offset 밀림 방지)
                 foreach ($insertPoints as $pos) {
                     if ($usedIdx >= count($localImages)) break;
-                    $p = $localImages[$usedIdx++];
+                    $p = $localImages[$usedIdx];
+                    $cap = $localCaptions[$usedIdx] ?: ($keyword . ' 관련 이미지');
+                    $usedIdx++;
                     $paths[] = $p;
-                    $imgHtml = "\n" . $this->buildFigureHtml($p, $keyword) . "\n";
+                    $imgHtml = "\n" . $this->buildFigureHtml($p, $cap, $keyword) . "\n";
                     $html = substr($html, 0, $pos) . $imgHtml . substr($html, $pos);
                     write_log("🖼️ 네이버 이미지 자동 삽입(H2 사이): " . basename($p));
                 }
@@ -1377,7 +1397,7 @@ class ImageOptimizer {
      * @param string $srcPath 원본 이미지 경로
      * @return string|null 변조된 이미지 경로
      */
-    public static function disguise($srcPath) {
+    public static function disguise($srcPath, $pad = true) {
         if (!file_exists($srcPath)) return null;
 
         $info = @getimagesize($srcPath);
@@ -1396,23 +1416,49 @@ class ImageOptimizer {
         }
         if (!$src) return $srcPath;
 
-        // ── 변조 1: 랜덤 크롭 (4~10%, 위치도 랜덤) ──
-        //    ★ v8: 크롭 폭을 키우고 좌/우·상/하 비율을 랜덤화 → 구도 자체가 달라짐
-        $cropPctW = mt_rand(4, 10) / 100;
-        $cropPctH = mt_rand(4, 10) / 100;
-        $cropL = (int)($origW * $cropPctW * (mt_rand(15, 85) / 100));
-        $cropR = (int)($origW * $cropPctW) - $cropL;
-        $cropT = (int)($origH * $cropPctH * (mt_rand(15, 85) / 100));
-        $cropB = (int)($origH * $cropPctH) - $cropT;
-        $newW = max(50, $origW - $cropL - $cropR);
-        $newH = max(50, $origH - $cropT - $cropB);
+        // ── 변조 1: 캔버스 덧대기 (★ v8.1: 크롭 대신) ──
+        //    원본은 한 픽셀도 자르지 않고 비율 그대로 둔 채, 바깥에 3~9% 여백(캔버스)을 랜덤 비대칭으로 덧댐.
+        //    여백은 ① 원본을 확대+블러한 '번짐 배경' 또는 ② 이미지 가장자리 평균색의 부드러운 단색.
+        //    → 해상도/비율/픽셀 배치가 모두 달라지면서도 원본 내용은 100% 보존됨.
+        $padPctW = $pad ? mt_rand(3, 9) / 100 : 0;
+        $padPctH = $pad ? mt_rand(3, 9) / 100 : 0;
+        $padL = (int)($origW * $padPctW * (mt_rand(20, 80) / 100));
+        $padR = (int)($origW * $padPctW) - $padL;
+        $padT = (int)($origH * $padPctH * (mt_rand(20, 80) / 100));
+        $padB = (int)($origH * $padPctH) - $padT;
+        $newW = $origW + $padL + $padR;
+        $newH = $origH + $padT + $padB;
 
-        $cropped = imagecreatetruecolor($newW, $newH);
-        imagealphablending($cropped, false);
-        imagesavealpha($cropped, true);
-        imagecopyresampled($cropped, $src, 0, 0, $cropL, $cropT, $newW, $newH, $newW, $newH);
+        $canvas = imagecreatetruecolor($newW, $newH);
+        $padStyle = !$pad ? 'none' : ((mt_rand(1, 100) <= 60) ? 'blur' : 'solid');
+        if ($padStyle === 'none') {
+            // 덧대기 없음 (썸네일용)
+        } elseif ($padStyle === 'blur') {
+            // 원본을 캔버스 크기로 늘려서 깔고 강하게 블러 → 번짐 배경
+            imagecopyresampled($canvas, $src, 0, 0, 0, 0, $newW, $newH, $origW, $origH);
+            for ($b = 0; $b < 12; $b++) imagefilter($canvas, IMG_FILTER_GAUSSIAN_BLUR);
+            imagefilter($canvas, IMG_FILTER_BRIGHTNESS, -mt_rand(10, 30));
+        } else {
+            // 가장자리 픽셀 평균색 (밝게 보정) 으로 채움
+            $sumR = $sumG = $sumB = $n = 0;
+            $stepX = max(1, (int)($origW / 40)); $stepY = max(1, (int)($origH / 40));
+            for ($x = 0; $x < $origW; $x += $stepX) {
+                foreach ([0, $origH - 1] as $y) { $c = imagecolorsforindex($src, imagecolorat($src, $x, $y)); $sumR += $c['red']; $sumG += $c['green']; $sumB += $c['blue']; $n++; }
+            }
+            for ($y = 0; $y < $origH; $y += $stepY) {
+                foreach ([0, $origW - 1] as $x) { $c = imagecolorsforindex($src, imagecolorat($src, $x, $y)); $sumR += $c['red']; $sumG += $c['green']; $sumB += $c['blue']; $n++; }
+            }
+            $n = max(1, $n);
+            $mix = mt_rand(55, 75) / 100; // 흰색과 섞어 부드럽게
+            $r = (int)(($sumR / $n) * (1 - $mix) + 255 * $mix);
+            $g = (int)(($sumG / $n) * (1 - $mix) + 255 * $mix);
+            $bcol = (int)(($sumB / $n) * (1 - $mix) + 255 * $mix);
+            imagefill($canvas, 0, 0, imagecolorallocate($canvas, $r, $g, $bcol));
+        }
+        // 원본을 그대로(리샘플 없이) 올림 — 비율/내용 100% 보존
+        imagecopy($canvas, $src, $padL, $padT, 0, 0, $origW, $origH);
         imagedestroy($src);
-        $src = $cropped;
+        $src = $canvas;
 
         // ── 변조 1-2: 좌우 반전 (옵션, 기본 OFF) ──
         //    ★ v8: api_keys.json → image_source.disguise_flip = true 로 켜면 30% 확률로 반전.
@@ -1542,7 +1588,7 @@ class ImageOptimizer {
 
         $origSize = filesize($srcPath);
         $newSize = filesize($outPath);
-        write_log("🎭 이미지 변조: " . basename($srcPath) . " → " . basename($outPath) . " (" . round($newSize/1024) . "KB, 크롭:" . round($cropPctW*100) . "/" . round($cropPctH*100) . "% 색감:{$tone}" . ($flipped ? ' 반전' : '') . ($vignette ? ' 비네팅' : '') . " 밝기:{$brightness} 대비:{$contrast} 테두리:{$borderW}px)");
+        write_log("🎭 이미지 변조: " . basename($srcPath) . " → " . basename($outPath) . " (" . round($newSize/1024) . "KB, 덧대기:" . round($padPctW*100) . "/" . round($padPctH*100) . "%({$padStyle}) 색감:{$tone}" . ($flipped ? ' 반전' : '') . ($vignette ? ' 비네팅' : '') . " 밝기:{$brightness} 대비:{$contrast} 테두리:{$borderW}px)");
 
         return $outPath;
     }
@@ -1583,18 +1629,17 @@ class ImageOptimizer {
         if (!$src) return $srcPath;
 
         if ($crop && $type === 'thumbnail') {
-            // 크롭 모드: 1200x630 비율로 중앙 크롭
-            $targetRatio = $maxW / $maxH;
-            $srcRatio = $origW / $origH;
-            if ($srcRatio > $targetRatio) {
-                $cropH = $origH; $cropW = (int)($origH * $targetRatio);
-                $cropX = (int)(($origW - $cropW) / 2); $cropY = 0;
-            } else {
-                $cropW = $origW; $cropH = (int)($origW / $targetRatio);
-                $cropX = 0; $cropY = (int)(($origH - $cropH) / 2);
-            }
+            // ★ v8.1: 크롭 대신 "비율 유지 + 번짐 배경" (레터박스)
+            //   1200x630 캔버스에 원본을 확대+블러해서 배경으로 깔고, 그 위에 원본을 비율 그대로 맞춰(contain) 올림.
+            //   → 원본이 잘리지 않음. 16:9가 아닌 이미지도 대표이미지로 자연스럽게 사용 가능.
             $dst = imagecreatetruecolor($maxW, $maxH);
-            imagecopyresampled($dst, $src, 0, 0, $cropX, $cropY, $maxW, $maxH, $cropW, $cropH);
+            imagecopyresampled($dst, $src, 0, 0, 0, 0, $maxW, $maxH, $origW, $origH);
+            for ($b = 0; $b < 14; $b++) imagefilter($dst, IMG_FILTER_GAUSSIAN_BLUR);
+            imagefilter($dst, IMG_FILTER_BRIGHTNESS, -25);
+            $scale = min($maxW / $origW, $maxH / $origH);
+            $fitW = max(1, (int)round($origW * $scale)); $fitH = max(1, (int)round($origH * $scale));
+            $offX = (int)(($maxW - $fitW) / 2); $offY = (int)(($maxH - $fitH) / 2);
+            imagecopyresampled($dst, $src, $offX, $offY, 0, 0, $fitW, $fitH, $origW, $origH);
         } else {
             // 리사이즈 모드: 비율 유지
             if ($origW <= $maxW && $origH <= $maxH) {

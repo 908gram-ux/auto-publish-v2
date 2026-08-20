@@ -897,16 +897,18 @@ class ImageGenerator {
             }
         }
 
-        // 3) 삽입 — 검색 실패/판별 탈락은 그라데이션 (텍스트 카드라 캡션과 항상 일치)
+        // 3) 삽입 — ★ v9.2: 검증을 통과한 이미지가 없는 자리는 "이미지 없이" 발행
+        //    (예전엔 텍스트 그라데이션 카드를 넣었는데, 본문에 큰 색상 박스가 박혀 보기 흉함)
         $paths = [];
         $imgIdx = 0;
-        $html = preg_replace_callback('/\[IMAGE:\s*(.+?)\]/', function($m) use(&$paths, &$imgIdx, $items, $self) {
+        $dropped = 0;
+        $html = preg_replace_callback('/\[IMAGE:\s*(.+?)\]/', function($m) use(&$paths, &$imgIdx, &$dropped, $items, $self) {
             $it = $items[$imgIdx++] ?? null;
-            if (!$it) return '';
-            $p = $it['path'] ?: $self->createGradientSection($it['alt']);
-            $paths[] = $p;
-            return $self->buildFigureHtml($p, $it['alt']);
+            if (!$it || !$it['path']) { $dropped++; return ''; }
+            $paths[] = $it['path'];
+            return $self->buildFigureHtml($it['path'], $it['alt']);
         }, $html);
+        if ($dropped > 0) write_log("ℹ️ 검증 통과 이미지 없는 자리 {$dropped}곳 → 이미지 없이 발행 (그라데이션 카드 미사용)");
         return ['content'=>$html, 'images'=>$paths];
     }
 

@@ -42,12 +42,6 @@ function getModelMaxTokens(string $model): int {
         'gemini-2.5-flash-lite' => 65536,
         'gemini-2.5-flash' => 65536,
         'gemini-2.5-pro' => 65536,
-        'gemini-3.5-flash-lite' => 65536,
-        'gemini-3.5-flash' => 65536,
-        'gemini-3.6-flash' => 65536,
-        'gemini-3.7-flash' => 65536,
-        'gemini-3.1-flash-lite' => 65536,
-        'gemini-3.1-pro-preview' => 65536,
     ];
 
     // 정확한 매칭
@@ -257,17 +251,18 @@ class GeminiProvider implements AIProvider {
         $apiKey = getKey('gemini.api_key');
         $maxTokens = clampMaxTokens($model, $maxTokens);
         $isPro = (strpos($model, 'pro') !== false);
-        $isGen3 = (strpos($model, 'gemini-3') === 0);   // ★ v9: Gemini 3.x 계열 (thinkingLevel 사용)
-        write_log("Gemini 모델: {$model}" . ($isPro ? " (Pro 모드)" : "") . ($isGen3 ? " [3.x]" : ""));
+        // ★ v8: Gemini 3.x 세대 감지 (gemini-3-flash, gemini-3.7-flash 등)
+        //    3.x 세대는 thinkingBudget(숫자) 파라미터를 받지 않고 thinkingLevel(문자열)을 씁니다.
+        //    구형 파라미터를 보내면 HTTP 400 INVALID_ARGUMENT → 응답 비어있음으로 실패했습니다.
+        $isGen3 = (bool)preg_match('/gemini-3/i', $model);
+        write_log("Gemini 모델: {$model}" . ($isPro ? " (Pro 모드)" : "") . ($isGen3 ? " (3.x 세대)" : ""));
 
-        // ── Pro vs Flash 설정 분기 ──
-        // Pro: thinking 활성화 (최소 1024, 여유 있게 8192), 긴 타임아웃
-        // Flash: thinking 비활성화, 일반 타임아웃
-        // ★ v9: Gemini 3.x는 thinkingBudget 대신 thinkingLevel(low/high) 사용, thinking 완전 비활성 불가
+        // ── 세대/등급별 설정 분기 ──
         $genConfig = ['maxOutputTokens' => $maxTokens];
         if ($isGen3) {
-            $genConfig['thinkingConfig'] = ['thinkingLevel' => $isPro ? 'high' : 'low'];
-            $timeout = $isPro ? 600 : 300;   // 3.x Flash도 thinking 있음 → 5분
+            // 3.x: thinking을 최소로 (low) → 출력 토큰 확보. 미지원 시 아래에서 자동 제거 후 재시도.
+            $genConfig['thinkingConfig'] = ['thinkingLevel' => 'low'];
+            $timeout = 300;
             $connectTimeout = 20;
             $maxRetries = 3;
         } elseif ($isPro) {
@@ -284,11 +279,14 @@ class GeminiProvider implements AIProvider {
         }
 
         $url = "https://generativelanguage.googleapis.com/v1beta/models/{$model}:generateContent?key={$apiKey}";
-        $payload = json_encode([
-            'system_instruction' => ['parts' => [['text' => $system]]],
-            'contents' => [['parts' => [['text' => $user]]]],
-            'generationConfig' => $genConfig,
-        ]);
+        $buildPayload = function ($cfg) use ($system, $user) {
+            return json_encode([
+                'system_instruction' => ['parts' => [['text' => $system]]],
+                'contents' => [['parts' => [['text' => $user]]]],
+                'generationConfig' => $cfg,
+            ]);
+        };
+        $payload = $buildPayload($genConfig);
 
         // ── 재시도 루프 (Pro 504/503/타임아웃 대응) ──
         for ($attempt = 0; $attempt <= $maxRetries; $attempt++) {
@@ -297,7 +295,7 @@ class GeminiProvider implements AIProvider {
                 write_log("Gemini 재시도 {$attempt}/{$maxRetries} ({$waitSec}초 대기)");
                 sleep($waitSec);
                 // 재시도 시 thinkingBudget 줄여서 속도 확보
-                if ($isPro && !$isGen3) {
+                if ($isPro) {
                     $genConfig['thinkingConfig']['thinkingBudget'] = max(1024, 8192 - ($attempt * 2048));
                     $payload = json_encode([
                         'system_instruction' => ['parts' => [['text' => $system]]],
@@ -348,6 +346,24 @@ class GeminiProvider implements AIProvider {
                 return null;
             }
 
+            // 400 INVALID_ARGUMENT: thinking 관련 파라미터 미지원일 수 있음 → 제거 후 1회 재시도
+            if ($code === 400 && isset($genConfig['thinkingConfig'])) {
+                write_log("Gemini HTTP 400 → thinkingConfig 제거 후 재시도: " . mb_substr($resp, 0, 300));
+                unset($genConfig['thinkingConfig']);
+                $payload = $buildPayload($genConfig);
+                $ch2 = curl_init($url);
+                curl_setopt_array($ch2, [
+                    CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true,
+                    CURLOPT_TIMEOUT => $timeout, CURLOPT_CONNECTTIMEOUT => $connectTimeout,
+                    CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+                    CURLOPT_POSTFIELDS => $payload,
+                ]);
+                $resp = curl_exec($ch2);
+                $code = curl_getinfo($ch2, CURLINFO_HTTP_CODE);
+                curl_close($ch2);
+                write_log("Gemini 재요청(thinking 제거) 응답: HTTP {$code}");
+            }
+
             // 기타 에러
             if ($code !== 200) {
                 write_log("Gemini HTTP {$code}: " . mb_substr($resp, 0, 500));
@@ -375,6 +391,9 @@ class GeminiProvider implements AIProvider {
                 // finishReason 체크
                 $finishReason = $r['candidates'][0]['finishReason'] ?? 'UNKNOWN';
                 write_log("Gemini 응답에 parts 없음 (finishReason: {$finishReason})");
+                if ($finishReason === 'MAX_TOKENS') {
+                    write_log("→ thinking 토큰이 출력 한도를 다 써버린 경우입니다. 글 길이를 '짧게'로 낮추거나 thinkingLevel을 낮추세요.");
+                }
                 if ($finishReason === 'RECITATION' || $finishReason === 'SAFETY') return null;
                 if ($attempt < $maxRetries) continue;
                 return null;
@@ -827,11 +846,23 @@ class AIRouter {
             $text = trim(implode("\n", $buffer));
             $buffer = [];
             if (!$text) return;
+            // ★ v9: 중간 정렬 문법 지원 — "-> 텍스트 <-" 로 감싼 문단은 가운데 정렬
+            //        (네이버 감성 스타일 글에서 핵심 문장·이모지 구분선을 가운데에 배치할 때 사용)
+            $isCenter = false;
+            if (preg_match('/^->\s*([\s\S]+?)\s*<-$/u', $text, $cm)) {
+                $isCenter = true;
+                $text = trim($cm[1]);
+            }
             // 인라인 마크다운 처리
             $text = preg_replace('/\*\*(.+?)\*\*/', '<strong>$1</strong>', $text);
             $text = preg_replace('/\*(.+?)\*/', '<em>$1</em>', $text);
             $text = preg_replace('/\[([^\]]+)\]\(([^)]+)\)/', '<a href="$2" target="_blank" rel="noopener">$1</a>', $text);
-            $blocks[] = "<!-- wp:paragraph -->\n<p>{$text}</p>\n<!-- /wp:paragraph -->";
+            if ($isCenter) {
+                // 인라인 스타일 병기 — 자체 CMS(테마 CSS 없는 곳)에서도 가운데 정렬 보장
+                $blocks[] = "<!-- wp:paragraph {\"align\":\"center\"} -->\n<p class=\"has-text-align-center\" style=\"text-align:center\">{$text}</p>\n<!-- /wp:paragraph -->";
+            } else {
+                $blocks[] = "<!-- wp:paragraph -->\n<p>{$text}</p>\n<!-- /wp:paragraph -->";
+            }
         };
 
         $flushList = function() use (&$buffer, &$blocks, &$inList) {
@@ -894,7 +925,10 @@ class AIRouter {
                 if ($tag === 'th') $head .= $tr; else $body .= $tr;
                 $skipNext = false;
             }
-            $tableHtml = '<figure class="wp-block-table"><table>';
+            // ★ v9: 가로폭 100% + 모바일 대응 — table-layout:fixed 로 화면 폭에 꽉 맞추고
+            //        셀 내용은 자동 줄바꿈 (자체 CMS에서도 동작하도록 인라인 스타일 사용)
+            $tableHtml = '<figure class="wp-block-table" style="width:100%;max-width:100%;margin:1.5em 0;">'
+                       . '<table style="width:100%;table-layout:fixed;border-collapse:collapse;word-break:keep-all;overflow-wrap:break-word;">';
             if ($head) $tableHtml .= "<thead>{$head}</thead>";
             if ($body) $tableHtml .= "<tbody>{$body}</tbody>";
             $tableHtml .= '</table></figure>';

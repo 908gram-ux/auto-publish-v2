@@ -547,34 +547,41 @@ class WebSearcher {
      *
      * @param string $keyword
      * @param int    $count   최종 필요한 이미지 수(썸네일 포함). 후보는 이보다 넉넉히 수집
-     * @param string $prefer  'naver' | 'google' — 먼저 채울 소스
-     * @return array 통합 후보 배열 (url 중복 제거, 소스 섞임)
+     * @param string $prefer  (v9부터 무시됨 — 하위호환용으로만 남김) 네이버·구글을 항상 균등 동시 수집
+     * @param string $extraQuery ★ v9: 보조 검색어 (예: AI가 지은 글 제목). 키워드 검색이 엉뚱한 결과를
+     *                           낼 때를 대비해 두 검색어로 각각 수집한 뒤 합칩니다.
+     * @return array 통합 후보 배열 (url 중복 제거, 소스 번갈아 섞임)
      */
-    public function searchWebImages($keyword, $count = 5, $prefer = 'naver') {
+    public function searchWebImages($keyword, $count = 5, $prefer = 'naver', $extraQuery = '') {
         $poolSize = max(8, $count * 3);            // AI가 고를 수 있게 3배 수집
         $half = (int)ceil($poolSize / 2);
 
-        $naver = [];
-        $google = [];
         $naverOk = getKey('naver.client_id') && getKey('naver.client_secret');
         $googleOk = getKey('serper.api_key') || (getKey('google.search_api_key') && getKey('google.search_cx'));
 
-        if ($prefer === 'google') {
-            if ($googleOk) $google = $this->searchGoogleImages($keyword, $half + 2);
-            if ($naverOk)  $naver  = $this->searchNaverImages($keyword, $poolSize - count($google));
-        } else {
-            if ($naverOk)  $naver  = $this->searchNaverImages($keyword, $half + 2);
-            if ($googleOk) $google = $this->searchGoogleImages($keyword, $poolSize - count($naver));
+        // ★ v9: 우선순위 없이 두 소스를 각각 절반씩 "동시에" 수집 (한쪽에 몰아주지 않음)
+        $naver  = $naverOk  ? $this->searchNaverImages($keyword, $half + 1)  : [];
+        $google = $googleOk ? $this->searchGoogleImages($keyword, $half + 1) : [];
+
+        // ★ v9: 보조 검색어(글 제목 등)로 추가 수집 — 키워드 띄어쓰기가 이상하거나
+        //       동음이의어(예: '인스 타' → 회사명 '인스하이' 매칭)로 엉뚱한 이미지가 잡히는 것을 보완
+        $extraQuery = trim((string)$extraQuery);
+        if ($extraQuery !== '' && mb_strtolower($extraQuery) !== mb_strtolower($keyword)) {
+            $extraCnt = max(3, (int)ceil($half / 2));
+            $naver2  = $naverOk  ? $this->searchNaverImages($extraQuery, $extraCnt)  : [];
+            $google2 = $googleOk ? $this->searchGoogleImages($extraQuery, $extraCnt) : [];
+            $naver  = array_merge($naver, $naver2);
+            $google = array_merge($google, $google2);
+            write_log("🖼️ 보조 검색어로 추가 수집: \"{$extraQuery}\" → 네이버 " . count($naver2) . "개 + 구글 " . count($google2) . "개");
         }
 
-        // 번갈아 섞기 (한 소스에만 편중 방지)
+        // 번갈아 섞기 (한 소스에만 편중 방지) — 순서도 랜덤으로 시작해 공평하게
         $merged = [];
         $seen = [];
-        $a = $prefer === 'google' ? $google : $naver;
-        $b = $prefer === 'google' ? $naver : $google;
-        $max = max(count($a), count($b));
+        $pair = mt_rand(0, 1) ? [$naver, $google] : [$google, $naver];
+        $max = max(count($pair[0]), count($pair[1]));
         for ($i = 0; $i < $max; $i++) {
-            foreach ([$a, $b] as $list) {
+            foreach ($pair as $list) {
                 if (!isset($list[$i])) continue;
                 $u = $list[$i]['url'] ?? '';
                 if (!$u || isset($seen[$u])) continue;
@@ -582,8 +589,8 @@ class WebSearcher {
                 $merged[] = $list[$i];
             }
         }
-        write_log("🖼️ 통합 이미지 후보: 네이버 " . count($naver) . "개 + 구글 " . count($google) . "개 = " . count($merged) . "개 (우선: {$prefer})");
-        return array_slice($merged, 0, $poolSize);
+        write_log("🖼️ 통합 이미지 후보(균등 동시 수집): 네이버 " . count($naver) . "개 + 구글 " . count($google) . "개 = " . count($merged) . "개");
+        return array_slice($merged, 0, $poolSize + 4);
     }
 
     /** Naver 테스트 결과 반환 */

@@ -406,14 +406,11 @@ if (isset($opts['job'])) {
             ghProgress($jobId, "[1/7] Naver 검색: {$kw}");
             $ndata = $searcher->searchAll($kw); sleep(1);
 
-            // ★ v6: 네이버 이미지 수집 (이미지 소스가 naver일 때)
-            // ★ v8: 네이버 + 구글 통합 수집 → AI가 글을 보고 고르도록 후보를 넉넉히 확보
+            // ★ v9: 웹 이미지 수집을 [2/7] AI 글 생성 **이후**로 이동
+            // 이유: 글 제목이 나온 뒤에 "키워드 + 제목" 두 검색어로 수집하면
+            //       키워드 띄어쓰기 문제('인스 타' → 회사명 매칭 등)로 엉뚱한 이미지가
+            //       후보에 섞이는 것을 크게 줄일 수 있음. (아래 [3/7] 직전에서 수집)
             $naverImages = [];
-            if ($postImgSrc === 'naver' || $postImgSrc === 'google') {
-                write_log("[1.5/7] 웹 이미지 후보 수집 (네이버+구글, 뉴스 제외, 본문 {$postImgCnt}개 + 썸네일)");
-                ghProgress($jobId, "[1.5/7] 네이버+구글 이미지 수집 중...");
-                $naverImages = $searcher->searchWebImages($kw, max(3, $postImgCnt + 1), $postImgSrc);
-            }
 
             // 2. AI 글 생성 (행별 설정 적용)
             write_log("[2/7] AI 글 생성 (AI:{$postAiMode} 이미지:{$postImgSrc} ×{$postImgCnt} 글자:{$contentMin}~{$contentMax})");
@@ -459,6 +456,8 @@ if (isset($opts['job'])) {
                 ghCallback('post_failed', ['job_id' => $jobId, 'post_idx' => $postIdx, 'error' => "본문 짧음({$len}자)"]);
                 $fail++; continue;
             }
+
+            $thumbCaption = ''; // ★ v9: 대표이미지 alt용 캡션 (웹수집 분기에서 AI가 채움)
 
             // 이미지 '사용안함' 처리
             if ($postImgSrc === 'none') {
@@ -510,15 +509,22 @@ if (isset($opts['job'])) {
                     }
                 }
 
+                // ★ v9: 글이 완성된 지금 시점에 수집 — 키워드 + 글 제목 두 검색어로 균등 동시 수집
+                write_log("[2.5/7] 웹 이미지 후보 수집 (네이버+구글 균등, 검색어: 키워드+제목)");
+                ghProgress($jobId, "[2.5/7] 네이버+구글 이미지 수집 중...");
+                $naverImages = $searcher->searchWebImages($kw, max(3, $postImgCnt + 1), $postImgSrc, $post['title'] ?? '');
+
                 write_log("[3/7] 수집 이미지 AI 판별 + 썸네일 선택");
                 ghProgress($jobId, "[3/7] AI가 이미지 보고 고르는 중...");
                 $thumb = null;
+                $thumbCaption = ''; // ★ v9: AI가 실제 이미지를 보고 쓴 캡션 (대표이미지 alt에 사용)
                 $bodyNaverImages = [];
                 if (!empty($naverImages)) {
                     $sel = $image->selectWebImages($naverImages, $post, $kw, $postImgCnt);
                     $bodyNaverImages = $sel['body'];
                     if (!empty($sel['thumb_raw'])) {
                         $thumb = $image->prepareFromRaw($sel['thumb_raw'], true);
+                        $thumbCaption = trim((string)($sel['thumb_caption'] ?? ''));
                     }
                 }
                 if (!$thumb) {
@@ -603,8 +609,13 @@ if (isset($opts['job'])) {
             // 5. WP 업로드
             write_log("[5/7] WP 업로드 ({$site['name']})");
             ghProgress($jobId, "[5/7] WP 업로드 중... ({$site['name']})");
-            // ★ v7: 썸네일 alt에 키워드 포함 (SEO 최적화)
-            $thumbAlt = $kw ? "{$kw} - {$post['title']}" : $post['title'];
+            // ★ v9: 썸네일 alt — AI가 "실제 이미지를 보고" 쓴 캡션을 최우선 사용
+            //        (예전엔 키워드+제목을 붙여서, 이미지와 무관한 설명이 달리는 문제가 있었음)
+            if (!empty($thumbCaption)) {
+                $thumbAlt = (mb_stripos($thumbCaption, $kw) === false && $kw) ? "{$kw} - {$thumbCaption}" : $thumbCaption;
+            } else {
+                $thumbAlt = $kw ? "{$kw} - {$post['title']}" : $post['title'];
+            }
             $tu = $thumb ? $wp->uploadImage($thumb, $thumbAlt) : null;
 
             $contentHtml = $post['content_html'];
@@ -854,8 +865,8 @@ foreach ($sites as $siteIdx => $site) {
                 // ★ v6: CLI --img=naver 네이버 수집  /  ★ v8: --img=google 도 지원, 네이버+구글 통합 + AI 판별
                 if ($cliImg === 'naver' || $cliImg === 'google') {
                     $cliImgCnt = max(1, intval($opts['imgcnt'] ?? 3)); // ★ --imgcnt=N (기본 3)
-                    write_log("[3/7] 웹 이미지 수집 (네이버+구글, 우선:{$cliImg}, 본문 {$cliImgCnt}개)");
-                    $naverImgs = $searcher->searchWebImages($kw, $cliImgCnt + 1, $cliImg);
+                    write_log("[3/7] 웹 이미지 수집 (네이버+구글 균등, 본문 {$cliImgCnt}개)");
+                    $naverImgs = $searcher->searchWebImages($kw, $cliImgCnt + 1, $cliImg, $post['title'] ?? '');
                     $thumb = null;
                     $bodyNaverImgs = [];
                     if (!empty($naverImgs)) {

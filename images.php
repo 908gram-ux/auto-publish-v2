@@ -940,10 +940,16 @@ class ImageGenerator {
      * @return int 가장 적합한 이미지의 인덱스 (기본 0)
      */
     public function pickBestThumbnailIndex($naverImages) {
-        if (empty($naverImages) || count($naverImages) <= 1) return 0;
+        if (empty($naverImages)) return -1;
+        if (count($naverImages) <= 1) {
+            // ★ v9: 후보가 1개뿐이어도 세로형이면 쓰지 않음
+            $w = intval($naverImages[0]['width'] ?? 0);
+            $h = intval($naverImages[0]['height'] ?? 0);
+            return ($w >= 200 && $h > 0 && ($w / $h) >= 1.0) ? 0 : -1;
+        }
 
         $targetRatio = 16 / 9; // ≈ 1.778
-        $bestIdx = 0;
+        $bestIdx = -1; // ★ v9: 적합한 후보가 하나도 없으면 -1 (예전엔 무조건 0번을 골라 엉뚱한 이미지가 대표가 됨)
         $bestDiff = PHP_FLOAT_MAX;
 
         foreach ($naverImages as $idx => $imgData) {
@@ -978,6 +984,10 @@ class ImageGenerator {
         }
 
         // 최종 선택된 이미지 로그
+        if ($bestIdx < 0) {
+            write_log("🚫 비율 기준을 통과한 썸네일 후보 없음 → 웹수집 썸네일 사용 안 함");
+            return -1;
+        }
         $selData = $naverImages[$bestIdx] ?? [];
         $selW = $selData['width'] ?? '?';
         $selH = $selData['height'] ?? '?';
@@ -1105,11 +1115,21 @@ class ImageGenerator {
             return ['thumb_raw' => $thumbIdx !== null ? $ready[$thumbIdx]['local_raw'] : null, 'thumb_caption' => $thumbCaption, 'body' => $bodyCands, 'ai_judged' => true];
         }
 
-        // AI 실패 → 기존 16:9 비율 방식
+        // ★ v9: AI 판별 실패 시 처리
+        // 예전에는 16:9 비율만 보고 아무 이미지나 골랐음 → 키워드가 애매하면
+        // 완전히 무관한 이미지(다른 회사 로고 등)가 대표이미지로 발행되는 사고 발생.
+        // 기본값: AI가 확인 못 한 웹수집 이미지는 **아예 사용하지 않음** (생성/그라데이션 폴백으로 넘어감)
+        $requireJudge = intval(getKey('image_source.require_ai_judge', 1));
+        if ($requireJudge) {
+            write_log("🚫 AI 이미지 판별 실패 → 확인 안 된 웹수집 이미지는 사용하지 않음 (썸네일·본문 모두 생성 폴백)");
+            return ['thumb_raw' => null, 'thumb_caption' => '', 'body' => [], 'ai_judged' => false, 'judge_failed' => true];
+        }
+
+        // (설정으로 끈 경우에만) 기존 16:9 비율 방식 — 단, 적합 후보 없으면 썸네일 안 씀
         $readyList = array_values($ready);
         $ti = $this->pickBestThumbnailIndex($readyList);
-        $thumbRaw = $readyList[$ti]['local_raw'] ?? null;
-        unset($readyList[$ti]);
+        $thumbRaw = ($ti >= 0) ? ($readyList[$ti]['local_raw'] ?? null) : null;
+        if ($ti >= 0) unset($readyList[$ti]);
         return ['thumb_raw' => $thumbRaw, 'thumb_caption' => '', 'body' => array_values($readyList), 'ai_judged' => false];
     }
 

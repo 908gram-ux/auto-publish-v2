@@ -528,8 +528,8 @@ if (isset($opts['job'])) {
                     }
                 }
                 if (!$thumb) {
-                    write_log("⚠️ 수집 이미지 중 썸네일 적합 이미지 없음 → 썸네일 생성 폴백 (AI이미지/그라데이션)");
-                    $thumb = $image->createThumbnail($post['title'], $kw, $post['thumbnail_prompt'] ?? '');
+                    write_log("⚠️ 수집 이미지 중 썸네일 적합 이미지 없음 → 생성(AI이미지/그라데이션) 폴백 — ★ v9.1: 무작위 스톡 금지");
+                    $thumb = $image->createThumbnail($post['title'], $kw, $post['thumbnail_prompt'] ?? '', false);
                 }
 
                 // ★ v7: 썸네일을 thumbnail 타입으로 최적화 (1200x630 크롭)
@@ -544,7 +544,7 @@ if (isset($opts['job'])) {
 
                 write_log("[4/7] 수집 이미지 본문 삽입 (최대 {$postImgCnt}개, AI 관련도 순)");
                 ghProgress($jobId, "[4/7] 이미지 변조+삽입 중...");
-                $proc = $image->processNaverImages($post['content_html'], $bodyNaverImages, $kw, $postImgCnt);
+                $proc = $image->processNaverImages($post['content_html'], $bodyNaverImages, $kw, $postImgCnt, ['title' => $post['title'] ?? '', 'keyword' => $kw, 'summary' => trim((string)($post['excerpt'] ?? ($post['meta_description'] ?? '')))]);
                 $post['content_html'] = $proc['content'] ?? $post['content_html'];
                 $imgs = $proc['images'] ?? [];
                 goto skipImages;
@@ -587,7 +587,7 @@ if (isset($opts['job'])) {
                 }
                 $imgSearches = array_slice($imgSearches, 0, $postImgCnt);
             }
-            $proc = $image->processImages($post['content_html'], $imgSearches);
+            $proc = $image->processImages($post['content_html'], $imgSearches, ['title' => $post['title'] ?? '', 'keyword' => $kw, 'summary' => trim((string)($post['excerpt'] ?? ($post['meta_description'] ?? '')))]);
             $post['content_html'] = $proc['content'] ?? $proc['html'] ?? $post['content_html'];
             $imgs = $proc['images'] ?? $proc['files'] ?? [];
 
@@ -874,14 +874,14 @@ foreach ($sites as $siteIdx => $site) {
                         $bodyNaverImgs = $sel['body'];
                         if (!empty($sel['thumb_raw'])) $thumb = $image->prepareFromRaw($sel['thumb_raw'], true);
                     }
-                    if (!$thumb) $thumb = $image->createThumbnail($post['title'], $kw, $post['thumbnail_prompt'] ?? '');
+                    if (!$thumb) $thumb = $image->createThumbnail($post['title'], $kw, $post['thumbnail_prompt'] ?? '', false); // ★ v9.1: 무작위 스톡 금지
                     // ★ v7: 썸네일 16:9 크롭 최적화
                     if ($thumb) {
                         $thumbOpt = ImageOptimizer::optimize($thumb, 'thumbnail');
                         if ($thumbOpt && $thumbOpt !== $thumb) { @unlink($thumb); $thumb = $thumbOpt; }
                     }
                     write_log("[4/7] 수집 이미지 본문 삽입 (AI 관련도 순)");
-                    $proc = $image->processNaverImages($post['content_html'], $bodyNaverImgs, $kw, $cliImgCnt);
+                    $proc = $image->processNaverImages($post['content_html'], $bodyNaverImgs, $kw, $cliImgCnt, ['title' => $post['title'] ?? '', 'keyword' => $kw, 'summary' => trim((string)($post['excerpt'] ?? ($post['meta_description'] ?? '')))]);
                     $content = $proc['content']; $imgs = $proc['images'];
                     goto skipImagesCli;
                 }
@@ -898,7 +898,7 @@ foreach ($sites as $siteIdx => $site) {
             $thumb = $image->createThumbnail($post['title'], $thumbSearch, $thumbPrompt);
             write_log("[4/7] 본문이미지");
             ghProgress($jobId, "[4/7] 본문 이미지 삽입 중...");
-            $proc = $image->processImages($post['content_html'], $imgSearches);
+            $proc = $image->processImages($post['content_html'], $imgSearches, ['title' => $post['title'] ?? '', 'keyword' => $kw, 'summary' => trim((string)($post['excerpt'] ?? ($post['meta_description'] ?? '')))]);
             $content = $proc['content']; $imgs = $proc['images'];
             // 이미지 소스 복원
             if ($origPriority !== null) {

@@ -559,17 +559,29 @@ class WebSearcher {
         $naverOk = getKey('naver.client_id') && getKey('naver.client_secret');
         $googleOk = getKey('serper.api_key') || (getKey('google.search_api_key') && getKey('google.search_cx'));
 
-        // ★ v9: 우선순위 없이 두 소스를 각각 절반씩 "동시에" 수집 (한쪽에 몰아주지 않음)
-        $naver  = $naverOk  ? $this->searchNaverImages($keyword, $half + 1)  : [];
-        $google = $googleOk ? $this->searchGoogleImages($keyword, $half + 1) : [];
+        // ★ v9.1: 수집 소스 결정 — 선택한 소스에서만 수집
+        //   이미지 소스 'naver' → 네이버만 / 'google' → 구글만
+        //   둘 다 섞고 싶으면 api_keys.json에 image_source.web_sources = "both"
+        $mode = strtolower(trim((string)getKey('image_source.web_sources', '')));
+        if (!in_array($mode, ['naver', 'google', 'both'], true)) {
+            $mode = ($prefer === 'google') ? 'google' : 'naver';
+        }
+        $useNaver  = $naverOk  && ($mode === 'naver'  || $mode === 'both');
+        $useGoogle = $googleOk && ($mode === 'google' || $mode === 'both');
+        // 선택한 소스의 키가 없으면 다른 소스로라도 수집 (이미지 0개 방지)
+        if (!$useNaver && !$useGoogle) { $useNaver = $naverOk; $useGoogle = $googleOk; }
+
+        $perSource = ($useNaver && $useGoogle) ? ($half + 1) : $poolSize;
+        $naver  = $useNaver  ? $this->searchNaverImages($keyword, $perSource)  : [];
+        $google = $useGoogle ? $this->searchGoogleImages($keyword, $perSource) : [];
 
         // ★ v9: 보조 검색어(글 제목 등)로 추가 수집 — 키워드 띄어쓰기가 이상하거나
         //       동음이의어(예: '인스 타' → 회사명 '인스하이' 매칭)로 엉뚱한 이미지가 잡히는 것을 보완
         $extraQuery = trim((string)$extraQuery);
         if ($extraQuery !== '' && mb_strtolower($extraQuery) !== mb_strtolower($keyword)) {
             $extraCnt = max(3, (int)ceil($half / 2));
-            $naver2  = $naverOk  ? $this->searchNaverImages($extraQuery, $extraCnt)  : [];
-            $google2 = $googleOk ? $this->searchGoogleImages($extraQuery, $extraCnt) : [];
+            $naver2  = $useNaver  ? $this->searchNaverImages($extraQuery, $extraCnt)  : [];
+            $google2 = $useGoogle ? $this->searchGoogleImages($extraQuery, $extraCnt) : [];
             $naver  = array_merge($naver, $naver2);
             $google = array_merge($google, $google2);
             write_log("🖼️ 보조 검색어로 추가 수집: \"{$extraQuery}\" → 네이버 " . count($naver2) . "개 + 구글 " . count($google2) . "개");

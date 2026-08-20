@@ -15,7 +15,7 @@ class StockImageSearch {
      * @param string $type 'thumbnail' (1200x630) or 'section' (800x400)
      * @return string|null 로컬 저장 경로
      */
-    public function search($query, $type = 'section') {
+    public function search($query, $type = 'section', $excludeStock = false) {
         $keys = loadApiKeys();
         $imgSettings = $keys['image_source'] ?? [];
         $priority = $imgSettings['priority'] ?? ['pixabay', 'pexels', 'gradient'];
@@ -25,6 +25,8 @@ class StockImageSearch {
         $tried = [];
         foreach ($priority as $source) {
             if ($source === 'gradient') continue; // gradient는 최후 폴백
+            // ★ v9.1: excludeStock=true면 무작위 스톡(pixabay/pexels) 건너뜀 — 글 내용 기반 생성(gemini/dalle)만 허용
+            if ($excludeStock && in_array($source, ['pixabay', 'pexels'], true)) continue;
             $tried[] = $source;
             $path = $this->tryImageSource($source, $query, $type);
             if ($path) {
@@ -34,7 +36,7 @@ class StockImageSearch {
         }
 
         // 2) 우선순위에 없었던 나머지 API 소스도 자동 폴백
-        $allSources = ['pixabay', 'pexels', 'gemini', 'dalle'];
+        $allSources = $excludeStock ? ['gemini', 'dalle'] : ['pixabay', 'pexels', 'gemini', 'dalle'];
         $remaining = array_diff($allSources, $tried);
         foreach ($remaining as $source) {
             $path = $this->tryImageSource($source, $query, $type);
@@ -685,17 +687,33 @@ class ImageGenerator {
      * 2차: 스톡 이미지 폴백
      * 3차: 그라데이션 폴백
      */
-    public function createThumbnail($title, $keyword = '', $thumbnailPrompt = '') {
+    public function createThumbnail($title, $keyword = '', $thumbnailPrompt = '', $allowStock = true) {
         $query = $keyword ?: $this->korToSearchTerm($title);
         $this->_currentTitle = $title;
         $this->_thumbnailPrompt = '';
-        
-        // 1차: 스톡/AI 이미지 (내부에서 Gemini→Pixabay→Pexels 순서대로 시도)
-        $stockPath = $this->stock->search($query, 'thumbnail');
+
+        // 1차: 스톡/AI 이미지 (내부에서 우선순위대로 시도)
+        // ★ v9.1: $allowStock=false면 무작위 스톡(pixabay/pexels) 제외 — 생성(gemini/dalle)만
+        $stockPath = $this->stock->search($query, 'thumbnail', !$allowStock);
+
+        // ★ v9.1: 스톡/생성 썸네일도 AI가 실제로 보고 확인 — 무관하면 그라데이션으로
+        //   ("로블록스 동물병원 게임" 글에 실제 수술실 사진이 대표로 걸리는 사고 방지)
+        if ($stockPath && intval(getKey('image_source.judge_stock', 1))) {
+            $judge = new ImageJudge();
+            $scores = $judge->judge([['url' => '', 'local_raw' => $stockPath]], [
+                'title' => $title, 'keyword' => $keyword, 'summary' => '', 'image_descs' => [],
+            ]);
+            $minScore = intval(getKey('image_source.min_relevance', 5));
+            if ($scores !== null && intval($scores[0]['score'] ?? 0) < $minScore) {
+                write_log("🚫 썸네일 후보(스톡/생성) 관련도 미달({$scores[0]['score']}점: {$scores[0]['reason']}) → 그라데이션 대체");
+                @unlink($stockPath);
+                $stockPath = null;
+            }
+        }
         if ($stockPath) return $stockPath;
-        
-        // 3차: 그라데이션 폴백
-        write_log("이미지 생성 실패 → 그라데이션 썸네일");
+
+        // 최후: 그라데이션 폴백 (제목 텍스트가 들어가서 주제와 항상 일치)
+        write_log("이미지 생성 실패/부적합 → 그라데이션 썸네일");
         $w=1200; $h=630;
         $pal = $this->getRandomPalette();
         $img = imagecreatetruecolor($w, $h);
@@ -815,36 +833,79 @@ class ImageGenerator {
      * [IMAGE: 설명 | search_term] 형식 지원
      * $aiSearches: AI가 생성한 영문 검색어 배열 (폴백용)
      */
-    public function processImages($html, $aiSearches = []) {
+    public function processImages($html, $aiSearches = [], $judgeCtx = null) {
         // ★ v7: 연속 이미지 방지 — 처리 전에 재배치
         $html = $this->redistributeImageTags($html);
 
-        $paths = [];
-        $imgIdx = 0;
-        $self = $this;
-        $html = preg_replace_callback('/\[IMAGE:\s*(.+?)\]/', function($m) use(&$paths, &$imgIdx, $aiSearches, $self) {
-            $parts = explode('|', $m[1], 2);
-            $altText = trim($parts[0]);
+        // 1) [IMAGE:] 태그 수집 + 스톡/생성 이미지 검색
+        preg_match_all('/\[IMAGE:\s*(.+?)\]/', $html, $tm);
+        if (empty($tm[0])) return ['content' => $html, 'images' => []];
 
-            // 검색어 우선순위: [IMAGE:설명|검색어] > AI image_searches > 한글변환
+        $self = $this;
+        $items = [];
+        foreach ($tm[1] as $i => $d) {
+            $parts = explode('|', $d, 2);
+            $altText = trim($parts[0]);
             if (isset($parts[1]) && trim($parts[1])) {
                 $searchTerm = trim($parts[1]);
-            } elseif (!empty($aiSearches[$imgIdx])) {
-                $searchTerm = $aiSearches[$imgIdx];
+            } elseif (!empty($aiSearches[$i])) {
+                $searchTerm = $aiSearches[$i];
             } else {
-                $searchTerm = $self->korToSearchTerm($altText);
+                $searchTerm = $this->korToSearchTerm($altText);
             }
-            $imgIdx++;
-
             write_log("이미지 검색: \"{$searchTerm}\" (alt: {$altText})");
+            $p = $this->stock->search($searchTerm, 'section');
+            $items[$i] = ['alt' => $altText, 'path' => $p];
+        }
 
-            // 스톡 이미지 검색
-            $p = $self->stock->search($searchTerm, 'section');
-            if (!$p) {
-                $p = $self->createGradientSection($altText);
+        // 2) ★ v9.1: 스톡/생성 이미지도 AI가 "실제로 보고" 글과 맞는지 판별
+        //    예전엔 영문 검색어로 받아온 스톡 사진을 검증 없이 그대로 넣어서
+        //    "카드샵 글에 포커 사진" 같은 사고가 남 → 이제 모든 사진이 판별을 거침
+        if ($judgeCtx && intval(getKey('image_source.judge_stock', 1))) {
+            $cands = [];
+            foreach ($items as $i => $it) {
+                if ($it['path']) $cands[$i] = ['url' => '', 'local_raw' => $it['path']];
             }
+            if (!empty($cands)) {
+                $judge = new ImageJudge();
+                $scores = $judge->judge($cands, [
+                    'title'   => (string)($judgeCtx['title'] ?? ''),
+                    'keyword' => (string)($judgeCtx['keyword'] ?? ''),
+                    'summary' => (string)($judgeCtx['summary'] ?? ''),
+                    'image_descs' => array_map(fn($it) => $it['alt'], $items),
+                ]);
+                $minScore = intval(getKey('image_source.min_relevance', 5));
+                if ($scores === null) {
+                    // 판별 불가(비전 AI 전부 실패) → 확인 안 된 스톡 사진은 전부 그라데이션으로 대체
+                    write_log("🚫 스톡 이미지 AI 판별 실패 → 확인 안 된 사진 대신 그라데이션 사용");
+                    foreach ($items as $i => $it) {
+                        if ($it['path']) { @unlink($it['path']); $items[$i]['path'] = null; }
+                    }
+                } else {
+                    foreach ($cands as $i => $_) {
+                        $sc = $scores[$i] ?? ['score' => 0, 'reason' => '판별 누락', 'caption' => ''];
+                        if ($sc['score'] < $minScore) {
+                            write_log("🚫 스톡 이미지 관련도 미달({$sc['score']}점: {$sc['reason']}) → 그라데이션 대체");
+                            @unlink($items[$i]['path']);
+                            $items[$i]['path'] = null;
+                        } elseif (!empty($sc['caption'])) {
+                            // ★ 캡션은 AI가 실제 이미지를 보고 쓴 내용으로 교체 (설명-이미지 불일치 방지)
+                            $items[$i]['alt'] = $sc['caption'];
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3) 삽입 — 검색 실패/판별 탈락은 그라데이션 (텍스트 카드라 캡션과 항상 일치)
+        $paths = [];
+        $imgIdx = 0;
+        $html = preg_replace_callback('/\[IMAGE:\s*(.+?)\]/', function($m) use(&$paths, &$imgIdx, $items, $self) {
+            $it = $items[$imgIdx++] ?? null;
+            if (!$it) return '';
+            $p = $it['path'] ?: $self->createGradientSection($it['alt']);
             $paths[] = $p;
-            return $self->buildFigureHtml($p, $altText);
+            return $self->buildFigureHtml($p, $it['alt']);
         }, $html);
         return ['content'=>$html, 'images'=>$paths];
     }
@@ -1220,7 +1281,7 @@ class ImageGenerator {
      * @param int $imageCount 최대 삽입할 이미지 수
      * @return array ['content'=>수정된HTML, 'images'=>로컬파일경로배열]
      */
-    public function processNaverImages($html, $naverImages, $keyword = '', $imageCount = 3) {
+    public function processNaverImages($html, $naverImages, $keyword = '', $imageCount = 3, $judgeCtx = null) {
         // ★ v7: 연속 이미지 방지
         $html = $this->redistributeImageTags($html);
         // 1단계: 이미지 다운로드 + 변조
@@ -1252,9 +1313,9 @@ class ImageGenerator {
                 write_log("ℹ️ 내용에 맞는 수집 이미지가 없음 → 본문 이미지 없이 진행 ([IMAGE] 태그 제거)");
                 return ['content' => preg_replace('/\[IMAGE:[^\]]*\]/', '', $html), 'images' => []];
             }
-            write_log("⚠️ 네이버 이미지 수집 실패 → [IMAGE] 태그 제거, 그라데이션 폴백");
-            // 폴백: 기존 processImages 로직 사용
-            return $this->processImages($html);
+            write_log("⚠️ 웹 이미지 수집 실패 → 스톡 폴백 (★ v9.1: 스톡도 AI 판별 거침)");
+            // 폴백: 스톡 경로 — 단, judgeCtx를 넘겨서 스톡 사진도 반드시 AI 판별을 거치게 함
+            return $this->processImages($html, [], $judgeCtx);
         }
 
         write_log("🖼️ 네이버 이미지 " . count($localImages) . "개 다운로드+변조 완료");

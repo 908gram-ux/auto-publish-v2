@@ -703,7 +703,7 @@ class ImageGenerator {
             $scores = $judge->judge([['url' => '', 'local_raw' => $stockPath]], [
                 'title' => $title, 'keyword' => $keyword, 'summary' => '', 'image_descs' => [],
             ]);
-            $minScore = intval(getKey('image_source.min_relevance', 5));
+            $minScore = intval(getKey('image_source.min_relevance', 6));
             if ($scores !== null && intval($scores[0]['score'] ?? 0) < $minScore) {
                 write_log("🚫 썸네일 후보(스톡/생성) 관련도 미달({$scores[0]['score']}점: {$scores[0]['reason']}) → 그라데이션 대체");
                 @unlink($stockPath);
@@ -874,7 +874,7 @@ class ImageGenerator {
                     'summary' => (string)($judgeCtx['summary'] ?? ''),
                     'image_descs' => array_map(fn($it) => $it['alt'], $items),
                 ]);
-                $minScore = intval(getKey('image_source.min_relevance', 5));
+                $minScore = intval(getKey('image_source.min_relevance', 6));
                 if ($scores === null) {
                     // 판별 불가(비전 AI 전부 실패) → 확인 안 된 스톡 사진은 전부 그라데이션으로 대체
                     write_log("🚫 스톡 이미지 AI 판별 실패 → 확인 안 된 사진 대신 그라데이션 사용");
@@ -1140,13 +1140,13 @@ class ImageGenerator {
             // 3) 썸네일: thumb_ok 최고점
             $best = -1;
             foreach ($scores as $idx => $sc) {
-                if ($sc['thumb_ok'] && $sc['score'] > $best && $sc['score'] >= 5) { $best = $sc['score']; $thumbIdx = $idx; }
+                if ($sc['thumb_ok'] && $sc['score'] > $best && $sc['score'] >= 6) { $best = $sc['score']; $thumbIdx = $idx; } // ★ v9.1: 엄격 기준 (6점 이상)
             }
             // 폴백: 가로형 & 글자 없음 중 최고점
             if ($thumbIdx === null) {
                 foreach ($scores as $idx => $sc) {
                     $w = $ready[$idx]['width'] ?? 0; $h = $ready[$idx]['height'] ?? 1;
-                    if ($h > 0 && $w / $h >= 1.15 && !$sc['has_text'] && $sc['score'] > $best && $sc['score'] >= 4) { $best = $sc['score']; $thumbIdx = $idx; }
+                    if ($h > 0 && $w / $h >= 1.15 && !$sc['has_text'] && $sc['score'] > $best && $sc['score'] >= 6) { $best = $sc['score']; $thumbIdx = $idx; } // ★ v9.1: 엄격 기준
                 }
             }
             $thumbCaption = '';
@@ -1158,7 +1158,7 @@ class ImageGenerator {
             }
             // 4) 본문: 점수순. ★ v8.1: 관련도 기준(기본 5점) 미만은 **절대 사용 안 함**
             //    → 5개 설정해도 맞는 이미지가 2~3개면 2~3개만 넣음 (억지로 채우지 않음)
-            $minScore = intval(getKey('image_source.min_relevance', 5));
+            $minScore = intval(getKey('image_source.min_relevance', 6));
             $body = [];
             foreach ($scores as $idx => $sc) {
                 if ($idx === $thumbIdx) continue;
